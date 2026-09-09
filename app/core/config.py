@@ -1,0 +1,68 @@
+from typing import Literal
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """App configuration.
+
+    The environment is the single source of truth. Every value must come from a
+    real environment variable (cloud) or the local `.env` file. There are no
+    silent fallbacks: if something is missing or invalid, the app refuses to
+    start instead of running with wrong settings.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    app_name: str
+    env: Literal["development", "production"]
+    host: str
+    port: int
+    # Comma-separated list of allowed frontend origins, e.g.
+    # "http://localhost:3000,https://app.shootpx.com"
+    cors_origins: str
+    # Base URL of the frontend, used to build links in emails (no trailing slash)
+    frontend_url: str
+    database_url: str
+    redis_url: str
+    cache_clear_secret: str
+    firebase_credentials_path: str
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str
+    smtp_password: str
+    email_from_name: str
+    email_from_address: str
+    # True when the app runs behind a reverse proxy / load balancer (Render, nginx…).
+    # Makes rate limiting use the real client IP from X-Forwarded-For instead of the
+    # proxy's IP. Keep False for local dev (X-Forwarded-For would be spoofable).
+    trust_proxy: bool
+    razorpay_key_id: str
+    razorpay_key_secret: str
+    razorpay_webhook_secret: str
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.env == "production"
+
+
+def load_settings() -> Settings:
+    try:
+        return Settings()
+    except Exception as exc:  # missing var, wrong type, bad value
+        raise RuntimeError(
+            "Environment configuration is invalid or incomplete. "
+            "Set every variable listed in .env.example (as real env vars in the "
+            f"cloud, or in a local .env file).\nDetails: {exc}"
+        ) from exc
+
+
+settings = load_settings()

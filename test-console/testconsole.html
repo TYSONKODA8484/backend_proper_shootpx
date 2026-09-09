@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ShootPX test console</title>
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 32px auto; padding: 0 16px; }
+    h2 { border-bottom: 1px solid #ddd; padding-bottom: 6px; margin-top: 28px; font-size: 15px; text-transform: uppercase; letter-spacing: .5px; color: #555; }
+    button { padding: 6px 12px; margin: 4px 4px 4px 0; cursor: pointer; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
+    button:hover { background: #f0f0f0; }
+    input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; }
+    pre { background: #f4f4f4; padding: 12px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; max-height: 460px; overflow: auto; }
+    #status { padding: 8px 12px; border-radius: 6px; background: #eee; font-size: 14px; }
+    .in { background: #dcfce7; }
+    .out { background: #fee2e2; }
+  </style>
+</head>
+<body>
+
+<h1>ShootPX test console</h1>
+<div id="status">not signed in</div>
+
+<h2>1. Auth</h2>
+<button id="login-btn">Sign in with Google</button>
+<button id="logout-btn">Sign out</button>
+<button id="me-btn">GET /auth/me</button>
+<button id="token-btn">Copy ID token</button>
+
+<h2>2. Email sign-in link</h2>
+<input id="mail-email" placeholder="email address" size="30" />
+<button id="authmail-btn">POST /auth/authmail</button>
+<div style="color:#777;font-size:13px;margin-top:4px;">
+  Sends a Firebase sign-in link to that address (check inbox + spam).
+</div>
+
+<h2>3. Teams &amp; invites</h2>
+<button id="teams-btn">GET /teams</button>
+<div id="invite-banner" hidden style="margin:8px 0;padding:8px 12px;border-radius:6px;background:#fef9c3;">
+  You opened a team invite.
+  <button id="accept-invite-btn">Sign in &amp; accept</button>
+  <div style="font-size:12px;color:#8a6d1a;margin-top:4px;">
+    Sign in with the same email the invite was sent to.
+  </div>
+</div>
+<div style="margin-top:8px;">
+  <input id="invite-team-id" placeholder="team_id (from GET /teams)" size="38" />
+  <input id="invite-email" placeholder="invitee email" size="26" />
+  <select id="invite-role">
+    <option value="editor">editor</option>
+    <option value="owner">owner</option>
+  </select>
+  <button id="send-invite-btn">POST /teams/{id}/invite</button>
+</div>
+<div style="margin-top:8px;">
+  <input id="team-id-2" placeholder="team_id" size="38" />
+  <button id="members-btn">GET members</button>
+  <input id="rename-name" placeholder="new name" size="18" />
+  <button id="rename-btn">PATCH rename</button>
+  <input id="remove-user-id" placeholder="member user_id" size="30" />
+  <button id="remove-member-btn">DELETE member</button>
+  <button id="delete-team-btn" style="color:#b91c1c">DELETE team</button>
+</div>
+
+<h2>4. Billing &amp; credits</h2>
+<div>
+  <input id="billing-team-id" placeholder="team_id" size="38" />
+  <button id="get-billing-btn">GET /teams/{id}/billing</button>
+  <span style="color:#777;font-size:13px;">any member — total / subscription / topup credits + plan</span>
+</div>
+<div style="margin-top:8px;">
+  <input id="pack-id" placeholder="credit_pack_id (from GET /landing/billing)" size="42" />
+  <button id="checkout-pack-btn">POST credit-pack checkout</button>
+  <span style="color:#777;font-size:13px;">owner only — opens Razorpay test checkout on success</span>
+</div>
+<div style="color:#777;font-size:13px;margin-top:4px;">
+  Completing the Razorpay test payment only adds credits once the backend has a
+  public URL for the webhook (local runs get the order_id but no credit grant).
+</div>
+
+<h2>5. Public</h2>
+<button id="health-btn">GET /health</button>
+<button id="billing-btn">GET /landing/billing</button>
+<button id="tools-btn">GET /landing/tools</button>
+
+<h2>6. Cache (admin)</h2>
+<input id="cache-secret" placeholder="cache clear secret" size="44" />
+<button id="clear-cache-btn">POST /admin/cache/clear</button>
+
+<h2>Log</h2>
+<button id="clear-log-btn">clear log</button>
+<pre id="log">(responses appear here)</pre>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
+  import {
+    getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged,
+    isSignInWithEmailLink, signInWithEmailLink,
+  } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+  import { firebaseConfig } from "./firebase-config.js";
+
+  const BACKEND_URL = "http://127.0.0.1:8000";
+  const auth = getAuth(initializeApp(firebaseConfig));
+
+  const logEl = document.getElementById("log");
+  const statusEl = document.getElementById("status");
+  const $ = (id) => document.getElementById(id);
+
+  const log = (label, data) => {
+    const body = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    logEl.textContent = `${label}\n${body}\n\n${logEl.textContent}`;
+  };
+
+  // keep the UI in sync with Firebase auth (also restores session on reload)
+  onAuthStateChanged(auth, (user) => {
+    if (user) {
+      statusEl.textContent = `signed in as ${user.email}`;
+      statusEl.className = "in";
+    } else {
+      statusEl.textContent = "not signed in";
+      statusEl.className = "out";
+    }
+  });
+
+  // one fetch helper for everything. opts.auth = true -> attach a fresh Firebase ID token
+  async function call(method, path, opts = {}) {
+    const label = `${method} ${path}`;
+    try {
+      const headers = { ...(opts.headers || {}) };
+
+      if (opts.auth) {
+        if (!auth.currentUser) return log(label, { error: "sign in first" });
+        headers.Authorization = `Bearer ${await auth.currentUser.getIdToken()}`;
+      }
+
+      let body = opts.body;
+      if (opts.json !== undefined) {
+        headers["Content-Type"] = "application/json";
+        body = JSON.stringify(opts.json);
+      }
+
+      const res = await fetch(`${BACKEND_URL}${path}`, { method, headers, body });
+      let data;
+      try { data = await res.json(); } catch { data = await res.text(); }
+      log(`${label}  [HTTP ${res.status}]`, data);
+      return { status: res.status, data };
+    } catch (err) {
+      log(`${label}  [request failed]`, {
+        error: String(err),
+        hint: "backend not running, or this page's origin is not in the backend CORS_ORIGINS",
+      });
+      return { status: 0, data: null };
+    }
+  }
+
+  $("login-btn").onclick = async () => {
+    try {
+      const { user } = await signInWithPopup(auth, new GoogleAuthProvider());
+      log("signed in", { email: user.email, uid: user.uid });
+    } catch (err) {
+      log("sign-in failed", { error: String(err) });
+    }
+  };
+
+  $("logout-btn").onclick = async () => {
+    await signOut(auth);
+    log("signed out", {});
+  };
+
+  $("token-btn").onclick = async () => {
+    if (!auth.currentUser) return log("token", { error: "sign in first" });
+    const token = await auth.currentUser.getIdToken();
+    await navigator.clipboard.writeText(token).catch(() => {});
+    log("ID token (copied to clipboard)", token);
+  };
+
+  $("me-btn").onclick        = () => call("GET", "/auth/me", { auth: true });
+
+  $("authmail-btn").onclick = () => {
+    const email = $("mail-email").value.trim();
+    if (!email) return log("POST /auth/authmail", { error: "enter an email" });
+    // remember the email so we can finish the sign-in when the link opens this page
+    try { localStorage.setItem("emailForSignIn", email); } catch {}
+    return call("POST", "/auth/authmail", {
+      json: { email, continue_url: `${window.location.origin}/testconsole.html` },
+    });
+  };
+
+  // --- Teams & invites ---
+  $("teams-btn").onclick = () => call("GET", "/teams", { auth: true });
+
+  $("send-invite-btn").onclick = () => {
+    const teamId = $("invite-team-id").value.trim();
+    const email = $("invite-email").value.trim();
+    const role = $("invite-role").value;
+    if (!teamId || !email) return log("POST invite", { error: "team_id and email required" });
+    return call("POST", `/teams/${teamId}/invite`, { auth: true, json: { email, role } });
+  };
+
+  const team2 = () => $("team-id-2").value.trim();
+  $("members-btn").onclick = () =>
+    team2() ? call("GET", `/teams/${team2()}/members`, { auth: true })
+            : log("members", { error: "team_id required" });
+  $("rename-btn").onclick = () =>
+    team2() && $("rename-name").value.trim()
+      ? call("PATCH", `/teams/${team2()}`, { auth: true, json: { name: $("rename-name").value.trim() } })
+      : log("rename", { error: "team_id and new name required" });
+  $("remove-member-btn").onclick = () =>
+    team2() && $("remove-user-id").value.trim()
+      ? call("DELETE", `/teams/${team2()}/members/${$("remove-user-id").value.trim()}`, { auth: true })
+      : log("remove member", { error: "team_id and member user_id required" });
+  $("delete-team-btn").onclick = () => {
+    if (!team2()) return log("delete team", { error: "team_id required" });
+    if (!confirm(`Delete team ${team2()}? This cannot be undone.`)) return;
+    return call("DELETE", `/teams/${team2()}`, { auth: true });
+  };
+
+  const params = new URLSearchParams(window.location.search);
+  const inviteToken = params.get("invite_token");
+  const inviteEmailHint = params.get("invite_email");
+
+  async function acceptInvite() {
+    if (!auth.currentUser) {
+      try {
+        await signInWithPopup(auth, new GoogleAuthProvider());
+      } catch (err) {
+        return log("sign-in failed", { error: String(err) });
+      }
+    }
+    await call("POST", `/invites/${inviteToken}/accept`, { auth: true });
+    window.history.replaceState({}, "", window.location.pathname);
+    $("invite-banner").hidden = true;
+  }
+
+  // On load: finish an email sign-in link, then auto-accept an invite if present.
+  (async () => {
+    if (isSignInWithEmailLink(auth, window.location.href)) {
+      let email = null;
+      try { email = localStorage.getItem("emailForSignIn"); } catch {}
+      email = email || inviteEmailHint || window.prompt("Confirm your email:");
+      if (email) {
+        try {
+          const { user } = await signInWithEmailLink(auth, email, window.location.href);
+          try { localStorage.removeItem("emailForSignIn"); } catch {}
+          log("email sign-in complete", { user: user.email });
+        } catch (err) {
+          log("email sign-in failed", { error: String(err) });
+        }
+      }
+    }
+
+    if (inviteToken) {
+      $("invite-banner").hidden = false;
+      $("accept-invite-btn").onclick = acceptInvite;
+      if (auth.currentUser) await acceptInvite();  // arrived via the email link -> just accept
+    } else if (isSignInWithEmailLink(auth, window.location.href)) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  })();
+
+  // --- Billing & credits ---
+  $("get-billing-btn").onclick = () => {
+    const teamId = $("billing-team-id").value.trim();
+    if (!teamId) return log("GET billing", { error: "team_id required" });
+    return call("GET", `/teams/${teamId}/billing`, { auth: true });
+  };
+
+  $("checkout-pack-btn").onclick = async () => {
+    const teamId = $("billing-team-id").value.trim();
+    const packId = $("pack-id").value.trim();
+    if (!teamId || !packId) return log("checkout", { error: "team_id and credit_pack_id required" });
+
+    const { status, data } = await call(
+      "POST", `/billing/teams/${teamId}/credit-packs/${packId}/checkout`, { auth: true }
+    );
+    if (status !== 200 || !data?.order_id) return;
+
+    if (typeof Razorpay === "undefined") {
+      return log("Razorpay checkout", { error: "checkout.js failed to load (offline?)", order: data });
+    }
+    const rzp = new Razorpay({
+      key: data.key_id,
+      order_id: data.order_id,
+      amount: data.amount,
+      currency: data.currency,
+      name: "ShootPX",
+      description: "Credit pack (test mode)",
+      prefill: { email: auth.currentUser?.email || "" },
+      handler: (resp) => log("Razorpay payment success (client)", resp),
+      modal: { ondismiss: () => log("Razorpay checkout", { dismissed: true }) },
+    });
+    rzp.on("payment.failed", (resp) => log("Razorpay payment failed", resp.error));
+    rzp.open();
+  };
+
+  $("health-btn").onclick    = () => call("GET", "/health");
+  $("billing-btn").onclick   = () => call("GET", "/landing/billing");
+  $("tools-btn").onclick     = () => call("GET", "/landing/tools");
+
+  $("clear-cache-btn").onclick = () =>
+    call("POST", "/admin/cache/clear", { headers: { "x-cache-secret": $("cache-secret").value } });
+
+  $("clear-log-btn").onclick = () => { logEl.textContent = ""; };
+</script>
+
+</body>
+</html>
