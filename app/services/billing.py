@@ -1,3 +1,6 @@
+import logging
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -6,7 +9,14 @@ from app.models.credit import Credit
 from app.models.subscription import Subscription
 from app.models.team_subscription import TeamSubscription
 from app.core.config import settings
-from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+
+class RazorpayCancelError(RuntimeError):
+    """Razorpay rejected or failed the subscription-cancel call. Distinct from
+    ValueError so callers can tell 'nothing to cancel' apart from 'the provider
+    call failed' (delete_team logs-and-continues on the latter)."""
 
 
 
@@ -102,9 +112,42 @@ def create_subscription_checkout(db: Session, team_id, subscription_id) -> dict:
         db.rollback()
         raise
 
+    # Store the real id NOW (not None) so a cancel during the pending window can
+    # actually reach Razorpay, and so a cancelled row can't be resurrected by a
+    # late subscription.activated webhook.
+    row.razorpay_subscription_id = razor_sub["id"]
     db.commit()
 
     return {
         "razorpay_subscription_id": razor_sub["id"],
         "key_id": settings.razorpay_key_id,
     }
+
+def cancel_subscription(db: Session, team_id) -> TeamSubscription:
+    team_sub = db.query(TeamSubscription).filter(
+        TeamSubscription.team_id == team_id,
+        TeamSubscription.status.in_(["active", "pending"]),
+    ).with_for_update().first()
+
+    if not team_sub:
+        raise ValueError("This team has no active subscription to cancel")
+
+    # Tell Razorpay to stop billing BEFORE we touch local state. If this fails we
+    # leave status untouched — never show 'cancelled' while the card is still
+    # being charged.
+    if team_sub.razorpay_subscription_id:
+        try:
+            razorpay_client.subscription.cancel(team_sub.razorpay_subscription_id)
+        except Exception as e:
+            logger.exception(
+                "Failed to cancel Razorpay subscription %s for team %s",
+                team_sub.razorpay_subscription_id, team_id,
+            )
+            raise RazorpayCancelError(
+                "Could not cancel the subscription with Razorpay. Please try again."
+            ) from e
+
+    team_sub.status = "cancelled"
+    db.commit()
+    return team_sub
+

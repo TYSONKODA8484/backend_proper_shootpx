@@ -1,10 +1,17 @@
+import logging
+from uuid import UUID
+
 from sqlalchemy.orm import Session
 
+from app.models.billing_transaction import BillingTransaction
 from app.models.team import Team
 from app.models.team_invite import TeamInvite
 from app.models.team_member import TeamMember
+from app.models.team_subscription import TeamSubscription
 from app.models.user import User
-from uuid import UUID
+from app.services.billing import cancel_subscription
+
+logger = logging.getLogger(__name__)
 
 # Hard cap on team size: owner + editors. Pending invites also count toward it
 # (each pending invite reserves a seat), so a team can never end up over the cap.
@@ -113,6 +120,23 @@ def remove_member(db: Session, team_id, target_user_id) -> None:
 
 
 def delete_team(db: Session, team_id) -> None:
+    # Stop Razorpay billing first. "Nothing to cancel" is the normal case; a real
+    # provider failure is logged for manual follow-up but must NOT block deletion
+    # (leaving the team half-deleted would be worse).
+    try:
+        cancel_subscription(db, team_id)
+    except ValueError:
+        pass  # no active subscription — expected, not an error
+    except Exception:
+        logger.error(
+            "MANUAL FOLLOW-UP NEEDED: failed to cancel Razorpay subscription while "
+            "deleting team %s — check the Razorpay dashboard directly. Deletion proceeded.",
+            team_id, exc_info=True,
+        )
+
+    # FKs to teams are ON DELETE NO ACTION, so every child row must go first.
+    db.query(BillingTransaction).filter(BillingTransaction.team_id == team_id).delete(synchronize_session=False)
+    db.query(TeamSubscription).filter(TeamSubscription.team_id == team_id).delete(synchronize_session=False)
     db.query(TeamInvite).filter(TeamInvite.team_id == team_id).delete(synchronize_session=False)
     db.query(TeamMember).filter(TeamMember.team_id == team_id).delete(synchronize_session=False)
     db.query(Team).filter(Team.id == team_id).delete(synchronize_session=False)

@@ -155,7 +155,7 @@ def test_subscription_checkout_reuses_cancelled_row_on_resubscribe(sub_client):
     assert res.status_code == 200
     assert len(state["created"]) == 1          # a fresh Razorpay subscription
     assert cancelled.status == "pending"       # row reused, not a new insert
-    assert cancelled.razorpay_subscription_id is None
+    assert cancelled.razorpay_subscription_id == "sub_test_1"  # real id stored, not None
     db.add.assert_not_called()
     db.commit.assert_called()
 
@@ -195,7 +195,10 @@ def test_subscription_checkout_requires_owner(sub_client, monkeypatch):
 # subscription.activated webhook
 # --------------------------------------------------------------------------- #
 
-def _activated_db(plan, team_sub_by_rzp=None, team_sub_by_team=None):
+def _activated_db(plan, locked=None, team_sub_by_team=None):
+    """`locked` = the row found (and locked) by razorpay_subscription_id — the
+    normal case, since checkout now stores the id. `team_sub_by_team` is only
+    consulted when `locked` is None (legacy / safety fallback)."""
     db = MagicMock()
     seen = {"ts": 0}
 
@@ -204,9 +207,9 @@ def _activated_db(plan, team_sub_by_rzp=None, team_sub_by_team=None):
         name = getattr(model, "__name__", "")
         if name == "TeamSubscription":
             seen["ts"] += 1
-            q.filter.return_value.first.return_value = (
-                team_sub_by_rzp if seen["ts"] == 1 else team_sub_by_team
-            )
+            val = locked if seen["ts"] == 1 else team_sub_by_team
+            q.filter.return_value.with_for_update.return_value.first.return_value = val
+            q.filter.return_value.first.return_value = val
         elif name == "Subscription":
             q.filter.return_value.first.return_value = plan
         return q
@@ -259,45 +262,43 @@ def test_activated_rejects_plan_id_mismatch(monkeypatch):
     db.add.assert_not_called()
 
 
-def test_activated_is_idempotent(monkeypatch):
+def test_activated_is_idempotent_when_row_already_active(monkeypatch):
     fetch = MagicMock()
     monkeypatch.setattr(webhooks_svc.razorpay_client.subscription, "fetch", fetch)
     monkeypatch.setattr(webhooks_svc, "refill_subscription_credits", lambda *a, **k: None)
 
-    db = _activated_db(FakePlan(), team_sub_by_rzp=MagicMock())  # already recorded
-    webhooks_svc.handle_subscription_activated(db, _sub_event("subscription.activated"))
-
-    fetch.assert_not_called()
-    db.add.assert_not_called()
-
-
-def test_activated_reuses_row_on_resubscribe(monkeypatch):
-    """A team that previously cancelled resubscribes — the single (UNIQUE) row is
-    reused, not a second insert that would violate the constraint."""
-    refills = []
-    monkeypatch.setattr(
-        webhooks_svc, "refill_subscription_credits",
-        lambda db, team_id, amount: refills.append((team_id, amount)),
-    )
-    monkeypatch.setattr(
-        webhooks_svc.razorpay_client.subscription, "fetch",
-        lambda sid: {"id": sid, "plan_id": REAL_PLAN_ID,
-                     "notes": {"team_id": str(TEAM_ID), "subscription_id": str(SUB_ID)}},
-    )
-    old_row = MagicMock(status="cancelled", razorpay_subscription_id="sub_old")
-    db = _activated_db(FakePlan(), team_sub_by_rzp=None, team_sub_by_team=old_row)
-
+    active = MagicMock(status="active", razorpay_subscription_id="sub_new")
+    db = _activated_db(FakePlan(), locked=active)
     webhooks_svc.handle_subscription_activated(db, _sub_event("subscription.activated", "sub_new"))
 
-    db.add.assert_not_called()                    # reused, not inserted
-    assert old_row.status == "active"
-    assert old_row.razorpay_subscription_id == "sub_new"
-    assert refills == [(str(TEAM_ID), 350)]
+    fetch.assert_not_called()          # short-circuited before any work
+    db.add.assert_not_called()
+    db.commit.assert_not_called()
+
+
+def test_activated_does_not_resurrect_a_cancelled_row(monkeypatch):
+    """The row was cancelled (during the pending window). A late webhook for that
+    same id must not reactivate it or grant credits."""
+    refills = []
+    fetch = MagicMock()
+    monkeypatch.setattr(webhooks_svc, "refill_subscription_credits",
+                        lambda *a, **k: refills.append(a))
+    monkeypatch.setattr(webhooks_svc.razorpay_client.subscription, "fetch", fetch)
+
+    cancelled = MagicMock(status="cancelled", razorpay_subscription_id="sub_new")
+    db = _activated_db(FakePlan(), locked=cancelled)
+    webhooks_svc.handle_subscription_activated(db, _sub_event("subscription.activated", "sub_new"))
+
+    assert refills == []
+    assert cancelled.status == "cancelled"   # unchanged
+    fetch.assert_not_called()
+    db.add.assert_not_called()
+    db.commit.assert_not_called()
 
 
 def test_activated_promotes_pending_row_from_checkout(monkeypatch):
-    """The normal flow now: checkout left a `pending` row; activation promotes it
-    in place — no duplicate insert."""
+    """The normal flow: checkout left a `pending` row carrying the real id;
+    activation promotes it in place — no duplicate insert."""
     refills = []
     monkeypatch.setattr(
         webhooks_svc, "refill_subscription_credits",
@@ -308,8 +309,8 @@ def test_activated_promotes_pending_row_from_checkout(monkeypatch):
         lambda sid: {"id": sid, "plan_id": REAL_PLAN_ID,
                      "notes": {"team_id": str(TEAM_ID), "subscription_id": str(SUB_ID)}},
     )
-    pending = MagicMock(status="pending", razorpay_subscription_id=None)
-    db = _activated_db(FakePlan(), team_sub_by_rzp=None, team_sub_by_team=pending)
+    pending = MagicMock(status="pending", razorpay_subscription_id="sub_new")
+    db = _activated_db(FakePlan(), locked=pending)
 
     webhooks_svc.handle_subscription_activated(db, _sub_event("subscription.activated", "sub_new"))
 
@@ -317,6 +318,27 @@ def test_activated_promotes_pending_row_from_checkout(monkeypatch):
     assert pending.status == "active"
     assert pending.razorpay_subscription_id == "sub_new"
     assert pending.credits_per_refill == 350
+    assert refills == [(str(TEAM_ID), 350)]
+
+
+def test_activated_inserts_when_id_not_on_any_row(monkeypatch):
+    """Fallback: the id isn't stored anywhere (legacy / race) and the team has no
+    row -> insert a fresh active row."""
+    refills = []
+    monkeypatch.setattr(
+        webhooks_svc, "refill_subscription_credits",
+        lambda db, team_id, amount: refills.append((team_id, amount)),
+    )
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.subscription, "fetch",
+        lambda sid: {"id": sid, "plan_id": REAL_PLAN_ID,
+                     "notes": {"team_id": str(TEAM_ID), "subscription_id": str(SUB_ID)}},
+    )
+    db = _activated_db(FakePlan(), locked=None, team_sub_by_team=None)
+
+    webhooks_svc.handle_subscription_activated(db, _sub_event("subscription.activated", "sub_new"))
+
+    db.add.assert_called_once()
     assert refills == [(str(TEAM_ID), 350)]
 
 
@@ -331,7 +353,7 @@ def test_activated_does_not_clobber_a_different_active_subscription(monkeypatch)
                      "notes": {"team_id": str(TEAM_ID), "subscription_id": str(SUB_ID)}},
     )
     other = MagicMock(status="active", razorpay_subscription_id="sub_OTHER")
-    db = _activated_db(FakePlan(), team_sub_by_rzp=None, team_sub_by_team=other)
+    db = _activated_db(FakePlan(), locked=None, team_sub_by_team=other)
 
     webhooks_svc.handle_subscription_activated(db, _sub_event("subscription.activated", "sub_new"))
 
