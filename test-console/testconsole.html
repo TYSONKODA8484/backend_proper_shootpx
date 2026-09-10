@@ -73,6 +73,11 @@
   <button id="checkout-pack-btn">POST credit-pack checkout</button>
   <span style="color:#777;font-size:13px;">owner only — opens Razorpay test checkout on success</span>
 </div>
+<div style="margin-top:8px;">
+  <input id="subscription-id" placeholder="subscription_id (weekly/monthly/yearly UUID)" size="42" />
+  <button id="checkout-sub-btn">POST subscription checkout</button>
+  <span style="color:#777;font-size:13px;">owner only — opens Razorpay subscription checkout on success</span>
+</div>
 <div style="color:#777;font-size:13px;margin-top:4px;">
   Completing the Razorpay test payment only adds credits once the backend has a
   public URL for the webhook (local runs get the order_id but no credit grant).
@@ -99,7 +104,8 @@
   } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
   import { firebaseConfig } from "./firebase-config.js";
 
-  const BACKEND_URL = "http://127.0.0.1:8000";
+  // const BACKEND_URL = "http://127.0.0.1:8000"; // dev mode
+  const BACKEND_URL = "https://backend-proper-shootpx.onrender.com"; // staging mode render 
   const auth = getAuth(initializeApp(firebaseConfig));
 
   const logEl = document.getElementById("log");
@@ -287,6 +293,33 @@
       description: "Credit pack (test mode)",
       prefill: { email: auth.currentUser?.email || "" },
       handler: (resp) => log("Razorpay payment success (client)", resp),
+      modal: { ondismiss: () => log("Razorpay checkout", { dismissed: true }) },
+    });
+    rzp.on("payment.failed", (resp) => log("Razorpay payment failed", resp.error));
+    rzp.open();
+  };
+
+  $("checkout-sub-btn").onclick = async () => {
+    const teamId = $("billing-team-id").value.trim();
+    const subId = $("subscription-id").value.trim();
+    if (!teamId || !subId) return log("subscription checkout", { error: "team_id and subscription_id required" });
+
+    const { status, data } = await call(
+      "POST", `/billing/teams/${teamId}/subscriptions/${subId}/checkout`, { auth: true }
+    );
+    if (status !== 200 || !data?.razorpay_subscription_id) return;
+
+    if (typeof Razorpay === "undefined") {
+      return log("Razorpay checkout", { error: "checkout.js failed to load (offline?)", subscription: data });
+    }
+    // Subscription checkout: pass subscription_id (not order_id) in the options.
+    const rzp = new Razorpay({
+      key: data.key_id,
+      subscription_id: data.razorpay_subscription_id,
+      name: "ShootPX",
+      description: "Subscription (test mode)",
+      prefill: { email: auth.currentUser?.email || "" },
+      handler: (resp) => log("Razorpay subscription success (client)", resp),
       modal: { ondismiss: () => log("Razorpay checkout", { dismissed: true }) },
     });
     rzp.on("payment.failed", (resp) => log("Razorpay payment failed", resp.error));
