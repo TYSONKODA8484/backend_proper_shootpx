@@ -17,3 +17,4 @@ class Subscription(Base):
     info = Column(JSONB, nullable=False, default=list)
     tag = Column(Text, nullable=True)
     sort_order = Column(Integer, nullable=False, default=0)
+    razorpay_plan_id = Column(Text, nullable=True)  
