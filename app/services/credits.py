@@ -23,14 +23,20 @@ def add_topup_credits(db: Session, team_id, amount: int, commit: bool = True) ->
     return team
 
 
-def refill_subscription_credits(db: Session, team_id, amount: int) -> Team:
-    """Scheduled periodic refill — replaces, doesn't add. Unused credits lapse."""
+def refill_subscription_credits(db: Session, team_id, amount: int, commit: bool = True) -> Team:
+    """Scheduled periodic refill — replaces, doesn't add. Unused credits lapse.
+
+    Pass commit=False when the caller needs the balance change committed in the
+    same transaction as something else (e.g. the refill worker, which advances
+    next_refill_at atomically with the top-up).
+    """
     team = db.query(Team).filter(Team.id == team_id).with_for_update().first()
     if not team:
         raise ValueError("Team not found")
 
     team.subscription_credits_remaining = amount
-    db.commit()
+    if commit:
+        db.commit()
     return team
 
 
