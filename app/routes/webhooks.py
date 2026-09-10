@@ -9,6 +9,7 @@ from app.services.webhooks import (
     handle_subscription_charged,
     handle_subscription_halted,
     handle_subscription_cancelled,
+    handle_subscription_pending
 )
 router = APIRouter(prefix="/billing", tags=["webhooks"])
 
@@ -38,5 +39,7 @@ async def razorpay_webhook(
         handle_subscription_halted(db, event)
     elif event_type == "subscription.cancelled":
         handle_subscription_cancelled(db, event)
+    elif event_type == "subscription.pending":
+        handle_subscription_pending(db, event)
 
     return {"status": "ok"}

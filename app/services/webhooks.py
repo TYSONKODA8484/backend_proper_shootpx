@@ -289,3 +289,16 @@ def handle_subscription_cancelled(db: Session, event: dict):
     if team_sub:
         team_sub.status = "cancelled"
         db.commit()
+
+
+def handle_subscription_pending(db: Session, event: dict) -> None:
+    # A renewal payment failed; Razorpay is in its 3-day retry window. Pause
+    # refills (the worker skips non-active rows) but leave the existing balance
+    # alone. Only active -> pending; never touch pending/cancelled/halted.
+    sub_entity = event["payload"]["subscription"]["entity"]
+    team_sub = db.query(TeamSubscription).filter(
+        TeamSubscription.razorpay_subscription_id == sub_entity["id"]
+    ).first()
+    if team_sub and team_sub.status == "active":
+        team_sub.status = "pending"
+        db.commit()
