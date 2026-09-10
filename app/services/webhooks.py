@@ -133,11 +133,22 @@ def _credits_per_refill(plan: Subscription) -> int:
 def handle_subscription_activated(db: Session, event: dict) -> None:
     razorpay_subscription_id = event["payload"]["subscription"]["entity"]["id"]
 
-    # Idempotency: this exact Razorpay subscription is already recorded.
-    existing = db.query(TeamSubscription).filter(
+    # Checkout stores the real razorpay_subscription_id on a `pending` row, so
+    # this exact subscription is normally already on a row. Lock it and act on its
+    # status:
+    #   * active    -> already promoted (idempotent replay) -> skip
+    #   * cancelled -> the owner cancelled during the pending window -> a
+    #                  late-arriving webhook must NOT resurrect it -> skip
+    #   * pending   -> this is the activation we've been waiting for -> promote
+    #   * (no row)  -> fall through to the notes-based lookup below
+    locked = db.query(TeamSubscription).filter(
         TeamSubscription.razorpay_subscription_id == razorpay_subscription_id
-    ).first()
-    if existing:
+    ).with_for_update().first()
+    if locked is not None and locked.status in ("active", "cancelled"):
+        logger.info(
+            "subscription.activated for %s ignored — row already %s",
+            razorpay_subscription_id, locked.status,
+        )
         return
 
     # Fetch server-to-server — never trust the webhook payload's own notes (same
@@ -177,24 +188,27 @@ def handle_subscription_activated(db: Session, event: dict) -> None:
     # re-grant this period — it checks now vs next_refill_at.
     next_refill_at = now + (timedelta(days=30) if plan.period_label == "year" else period)
 
-    # Exactly one subscription row per team (UNIQUE team_id):
-    #   * a `pending` row from the in-progress checkout -> promote it in place
-    #   * a `cancelled` / `halted` row -> reuse it as a brand-new lifecycle
-    #   * no row -> insert
-    team_sub = db.query(TeamSubscription).filter(
-        TeamSubscription.team_id == team_id
-    ).first()
+    # Exactly one subscription row per team (UNIQUE team_id). Normally `locked`
+    # (found by razorpay_subscription_id) IS the team's row — a `pending` row from
+    # the in-progress checkout, promoted here in place. Only fall back to a
+    # team_id lookup when this id isn't on any row yet.
+    team_sub = locked
+    if team_sub is None:
+        team_sub = db.query(TeamSubscription).filter(
+            TeamSubscription.team_id == team_id
+        ).with_for_update().first()
 
     if (
         team_sub is not None
-        and team_sub.status == "active"
+        and team_sub.status in ("active", "cancelled")
         and team_sub.razorpay_subscription_id not in (None, razorpay_subscription_id)
     ):
-        # already an active subscription under a different Razorpay id — don't
-        # clobber it (checkout should never have allowed this).
+        # this team already has a terminal subscription under a different Razorpay
+        # id — don't clobber it (checkout should never have allowed this).
         logger.error(
-            "subscription.activated %s but team %s already active under %s",
-            razorpay_subscription_id, team_id, team_sub.razorpay_subscription_id,
+            "subscription.activated %s but team %s row is %s under %s",
+            razorpay_subscription_id, team_id, team_sub.status,
+            team_sub.razorpay_subscription_id,
         )
         return
 

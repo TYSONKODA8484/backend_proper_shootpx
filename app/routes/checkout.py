@@ -8,9 +8,12 @@ from app.core.limiter import limiter
 from app.deps import get_current_user
 from app.models.user import User
 from app.services.teams import is_team_owner
-from app.services.billing import create_credit_pack_checkout
-from app.services.billing import create_subscription_checkout
-
+from app.services.billing import (
+    create_credit_pack_checkout,
+    create_subscription_checkout,
+    cancel_subscription,
+    RazorpayCancelError,
+)
 router = APIRouter(prefix="/billing", tags=["checkout"])
 
 
@@ -52,3 +55,21 @@ def checkout_subscription(
         raise HTTPException(status_code=400, detail=str(e))
 
     return checkout
+
+@router.post("/teams/{team_id}/subscriptions/cancel")
+@limiter.limit("10/minute")
+def cancel_team_subscription(
+    request: Request,
+    team_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not is_team_owner(db, team_id, user.id):
+        raise HTTPException(status_code=403, detail="Only the team owner can cancel the subscription")
+
+    try:
+        cancel_subscription(db, team_id)
+    except (ValueError, RazorpayCancelError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"status": "cancelled", "teamId": str(team_id)}
