@@ -122,6 +122,47 @@ def test_refill_skips_when_plan_missing(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# subscription.completed -> scheduler's existing lapse-pass, end to end
+# --------------------------------------------------------------------------- #
+
+def test_completed_then_scheduled_lapse_zeros_credits_end_to_end(monkeypatch):
+    """subscription.completed (webhooks.py) only ever flips status to
+    'cancelled' — it never touches next_refill_at. This confirms that's
+    sufficient: the SAME next_refill_at the row already carried from
+    activation/its last refill is exactly what the scheduler's existing
+    lapse-pass uses to decide when to zero the leftover pool, so the two
+    compose correctly with zero additional code."""
+    monkeypatch.setattr(worker, "refill_subscription_credits", lambda *a, **k: None)
+
+    stale = datetime(2020, 1, 1, tzinfo=timezone.utc)   # already past its natural reset
+    team_sub = MagicMock(
+        team_id="team-x", status="active",
+        razorpay_subscription_id="sub_final", next_refill_at=stale,
+    )
+    completed_db = MagicMock()
+    (completed_db.query.return_value.filter.return_value
+        .with_for_update.return_value.first.return_value) = team_sub
+
+    webhooks_svc.handle_subscription_completed(
+        completed_db,
+        {"event": "subscription.completed",
+         "payload": {"subscription": {"entity": {"id": "sub_final"}}}},
+    )
+    assert team_sub.status == "cancelled"
+    completed_db.commit.assert_called_once()
+
+    # the daily scheduler now runs and finds this same row past its reset date
+    team = MagicMock(subscription_credits_remaining=42, topup_credits_balance=10)
+    db = _refill_db(lapse_due=[team_sub], team_for_update=team)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    _run(worker.refill_due_subscriptions({}))
+
+    assert team.subscription_credits_remaining == 0
+    assert team.topup_credits_balance == 10          # untouched
+
+
+# --------------------------------------------------------------------------- #
 # refill_due_subscriptions — lapsing cancelled-subscription credits (PRD §5)
 # --------------------------------------------------------------------------- #
 

@@ -14,6 +14,10 @@ from datetime import datetime, timedelta, timezone
 from app.models.team_subscription import TeamSubscription
 from app.models.subscription import Subscription
 from app.services.credits import refill_subscription_credits
+from app.models.team_member import TeamMember
+from app.models.user import User
+from app.core.email import send_email
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +299,25 @@ def handle_subscription_charged(db: Session, event: dict) -> None:
         if plan.period_label != "year" and paid_count > 1:
             team_sub.next_refill_at = now + period
             refill_subscription_credits(db, team_sub.team_id, team_sub.credits_per_refill)
+
+            # Renewal notice: warn the owner one cycle before this subscription
+            # naturally completes (total_count reached).
+            if plan.total_count and paid_count == plan.total_count - 1:
+                owner_membership = db.query(TeamMember).filter(
+                    TeamMember.team_id == team_sub.team_id,
+                    TeamMember.role == "owner",
+                ).first()
+                if owner_membership:
+                    owner = db.query(User).filter(User.id == owner_membership.user_id).first()
+                    if owner:
+                        send_email(
+                            to=owner.email,
+                            subject="Your ShootPX plan is ending soon",
+                            html=(
+                                f"Your current plan will complete after your next billing cycle. "
+                                f"Renew to keep your credits flowing: {settings.frontend_url}/billing"
+                            ),
+                        )
     # Yearly plans: a renewal charge only extends current_period_end. The 12
     # monthly slices between once-a-year charges are delivered by the daily
     # refill_due_subscriptions scheduler in worker.py.
@@ -332,4 +355,15 @@ def handle_subscription_pending(db: Session, event: dict) -> None:
     ).with_for_update().first()
     if team_sub and team_sub.status == "active":
         team_sub.status = "pending"
+        db.commit()
+
+
+def handle_subscription_completed(db: Session, event: dict):
+    sub_entity = event["payload"]["subscription"]["entity"]
+    team_sub = db.query(TeamSubscription).filter(
+        TeamSubscription.razorpay_subscription_id == sub_entity["id"]
+    ).with_for_update().first()
+
+    if team_sub and team_sub.status == "active":
+        team_sub.status = "cancelled"
         db.commit()
