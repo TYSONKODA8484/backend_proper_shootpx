@@ -374,6 +374,7 @@ def _charged_db(team_sub, plan):
         name = getattr(model, "__name__", "")
         if name == "TeamSubscription":
             q.filter.return_value.first.return_value = team_sub
+            q.filter.return_value.with_for_update.return_value.first.return_value = team_sub
         elif name == "Subscription":
             q.filter.return_value.first.return_value = plan
         return q
@@ -392,7 +393,10 @@ def test_charged_first_payment_does_not_double_refill(monkeypatch):
         webhooks_svc.razorpay_client.subscription, "fetch",
         lambda sid: {"id": sid, "paid_count": 1},  # the initial charge
     )
-    team_sub = MagicMock(team_id=str(TEAM_ID), subscription_id=str(SUB_ID), credits_per_refill=350)
+    team_sub = MagicMock(
+        team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+        credits_per_refill=350, last_paid_count=0,
+    )
     db = _charged_db(team_sub, FakePlan())
 
     webhooks_svc.handle_subscription_charged(db, _sub_event("subscription.charged"))
@@ -411,12 +415,45 @@ def test_charged_renewal_refills(monkeypatch):
         webhooks_svc.razorpay_client.subscription, "fetch",
         lambda sid: {"id": sid, "paid_count": 2},  # a renewal
     )
-    team_sub = MagicMock(team_id=str(TEAM_ID), subscription_id=str(SUB_ID), credits_per_refill=350)
+    team_sub = MagicMock(
+        team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+        credits_per_refill=350, last_paid_count=0,
+    )
     db = _charged_db(team_sub, FakePlan())
 
     webhooks_svc.handle_subscription_charged(db, _sub_event("subscription.charged"))
 
     assert refills == [(str(TEAM_ID), 350)]
+
+
+def test_charged_redelivered_webhook_does_not_double_refill_or_advance(monkeypatch):
+    """Razorpay can redeliver the same subscription.charged event. The second
+    delivery reports the SAME paid_count as the first, so it must be a no-op:
+    refill_subscription_credits fires only once, and next_refill_at / the
+    last_paid_count marker only advance once."""
+    refills = []
+    monkeypatch.setattr(
+        webhooks_svc, "refill_subscription_credits",
+        lambda db, team_id, amount: refills.append((team_id, amount)),
+    )
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.subscription, "fetch",
+        lambda sid: {"id": sid, "paid_count": 2},  # a renewal, unchanged across both deliveries
+    )
+    team_sub = MagicMock(
+        team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+        credits_per_refill=350, last_paid_count=1,
+    )
+    db = _charged_db(team_sub, FakePlan())
+    event = _sub_event("subscription.charged")
+
+    webhooks_svc.handle_subscription_charged(db, event)   # first delivery
+    first_next_refill_at = team_sub.next_refill_at
+    webhooks_svc.handle_subscription_charged(db, event)   # redelivered
+
+    assert refills == [(str(TEAM_ID), 350)]        # only the first delivery refilled
+    assert team_sub.last_paid_count == 2           # advanced once, not twice
+    assert team_sub.next_refill_at == first_next_refill_at  # not pushed out again
 
 
 def test_halted_and_cancelled_set_status(monkeypatch):

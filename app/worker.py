@@ -45,23 +45,35 @@ async def refill_due_subscriptions(ctx):
 
         for team_sub in due:
             try:
+                # Re-fetch and lock THIS row fresh — team_sub here is from the batch
+                # query taken at the top of this function, which may now be stale
+                # (e.g. the owner cancelled while an earlier row in this loop was
+                # being processed). Acting on the stale snapshot instead of this
+                # fresh, locked read is exactly what would let a cancelled team get
+                # refilled.
+                locked_sub = db.query(TeamSubscription).filter(
+                    TeamSubscription.id == team_sub.id
+                ).with_for_update().first()
+
+                if not locked_sub or locked_sub.status != "active":
+                    continue  # cancelled/switched since the batch query ran
+                if locked_sub.next_refill_at > now:
+                    continue  # already refilled by something else in the meantime
+
                 plan = db.query(Subscription).filter(
-                    Subscription.id == team_sub.subscription_id
+                    Subscription.id == locked_sub.subscription_id
                 ).first()
                 if not plan or plan.period_label not in _STEP:
                     continue
 
-                # balance replace + date advance commit together, so a crash
-                # between them can't leave next_refill_at un-advanced (which
-                # would re-refill and wipe the team's spent credits next run).
                 refill_subscription_credits(
-                    db, team_sub.team_id, team_sub.credits_per_refill, commit=False
+                    db, locked_sub.team_id, locked_sub.credits_per_refill, commit=False
                 )
-                team_sub.next_refill_at = now + _STEP[plan.period_label]
+                locked_sub.next_refill_at = now + _STEP[plan.period_label]
                 db.commit()
                 logger.info(
                     "Refilled subscription for team %s (=%s credits)",
-                    team_sub.team_id, team_sub.credits_per_refill,
+                    locked_sub.team_id, locked_sub.credits_per_refill,
                 )
             except Exception:
                 db.rollback()
@@ -69,7 +81,7 @@ async def refill_due_subscriptions(ctx):
                     "refill failed for team %s — skipping, will retry next run",
                     team_sub.team_id,
                 )
-
+    
         # Cancelled subscriptions: leftover subscription-pool credits stay usable
         # until the moment they'd have naturally reset (next_refill_at) — then
         # they lapse to zero, per PRD §5. Only the subscription pool is touched,
