@@ -14,6 +14,10 @@ class TeamSubscription(Base):
     razorpay_subscription_id = Column(Text, nullable=True)
     status = Column(Text, nullable=False, default="active")
     credits_per_refill = Column(Integer, nullable=False)
+    # Razorpay's own monotonic charge counter, last acted on. Lets
+    # handle_subscription_charged tell a genuinely new renewal apart from a
+    # redelivered webhook for a charge it already processed.
+    last_paid_count = Column(Integer, nullable=False, default=0)
     next_refill_at = Column(DateTime(timezone=True), nullable=False)
     current_period_end = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

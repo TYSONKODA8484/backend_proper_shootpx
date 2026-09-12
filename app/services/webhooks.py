@@ -187,6 +187,10 @@ def handle_subscription_activated(db: Session, event: dict) -> None:
     # first `subscription.charged` fires right after activation and must not
     # re-grant this period — it checks now vs next_refill_at.
     next_refill_at = now + (timedelta(days=30) if plan.period_label == "year" else period)
+    # A fresh lifecycle (first activation OR a resubscribe reusing the row) always
+    # starts this counter at 0, regardless of what a PREVIOUS subscription on this
+    # same row left behind.
+    last_paid_count = 0
 
     # Exactly one subscription row per team (UNIQUE team_id). Normally `locked`
     # (found by razorpay_subscription_id) IS the team's row — a `pending` row from
@@ -220,6 +224,7 @@ def handle_subscription_activated(db: Session, event: dict) -> None:
     team_sub.razorpay_subscription_id = razorpay_subscription_id
     team_sub.status = "active"
     team_sub.credits_per_refill = credits_per_refill
+    team_sub.last_paid_count = last_paid_count
     team_sub.next_refill_at = next_refill_at
     team_sub.current_period_end = now + period
 
@@ -236,9 +241,12 @@ def handle_subscription_activated(db: Session, event: dict) -> None:
 def handle_subscription_charged(db: Session, event: dict) -> None:
     razorpay_subscription_id = event["payload"]["subscription"]["entity"]["id"]
 
+    # Lock before reading — same as handle_subscription_activated. Razorpay can
+    # redeliver this exact webhook, and without the lock a redelivery arriving
+    # while the first is still mid-flight could read the same pre-update row.
     team_sub = db.query(TeamSubscription).filter(
         TeamSubscription.razorpay_subscription_id == razorpay_subscription_id
-    ).first()
+    ).with_for_update().first()
     if not team_sub:
         return  # activated never processed — nothing to update yet
 
@@ -258,15 +266,38 @@ def handle_subscription_charged(db: Session, event: dict) -> None:
     now = datetime.now(timezone.utc)
     period = _PERIOD[plan.period_label]
 
+    if team_sub.status == "cancelled":
+        logger.info(
+            "subscription.charged for %s ignored — row is cancelled",
+            razorpay_subscription_id,
+        )
+        return
+
+    if team_sub.status == "pending" and team_sub.credits_per_refill == 0:
+        logger.info(
+            "subscription.charged for %s arrived before activated — deferring",
+            razorpay_subscription_id,
+        )
+        return
+
     team_sub.status = "active"
     team_sub.current_period_end = now + period
 
-    if plan.period_label != "year" and paid_count > 1:
-        team_sub.next_refill_at = now + period
-        refill_subscription_credits(db, team_sub.team_id, team_sub.credits_per_refill)
+    # Idempotency: paid_count is Razorpay's own monotonic counter for this
+    # subscription, not something we derive from a clock. A redelivered webhook
+    # reports the SAME paid_count as the original, so only a value strictly
+    # greater than what we've already recorded is genuinely new — this is what
+    # stops a redelivery from re-refilling (refill REPLACES the pool, so acting
+    # twice would wipe out anything spent between deliveries) and from
+    # re-advancing next_refill_at a second time.
+    if paid_count > team_sub.last_paid_count:
+        team_sub.last_paid_count = paid_count
+        if plan.period_label != "year" and paid_count > 1:
+            team_sub.next_refill_at = now + period
+            refill_subscription_credits(db, team_sub.team_id, team_sub.credits_per_refill)
     # Yearly plans: a renewal charge only extends current_period_end. The 12
-    # monthly slices between once-a-year charges need the arq scheduler, which is
-    # NOT built yet.
+    # monthly slices between once-a-year charges are delivered by the daily
+    # refill_due_subscriptions scheduler in worker.py.
 
     db.commit()
 
@@ -275,7 +306,7 @@ def handle_subscription_halted(db: Session, event: dict):
     sub_entity = event["payload"]["subscription"]["entity"]
     team_sub = db.query(TeamSubscription).filter(
         TeamSubscription.razorpay_subscription_id == sub_entity["id"]
-    ).first()
+    ).with_for_update().first()
     if team_sub:
         team_sub.status = "halted"
         db.commit()
@@ -285,7 +316,7 @@ def handle_subscription_cancelled(db: Session, event: dict):
     sub_entity = event["payload"]["subscription"]["entity"]
     team_sub = db.query(TeamSubscription).filter(
         TeamSubscription.razorpay_subscription_id == sub_entity["id"]
-    ).first()
+    ).with_for_update().first()
     if team_sub:
         team_sub.status = "cancelled"
         db.commit()
@@ -298,7 +329,7 @@ def handle_subscription_pending(db: Session, event: dict) -> None:
     sub_entity = event["payload"]["subscription"]["entity"]
     team_sub = db.query(TeamSubscription).filter(
         TeamSubscription.razorpay_subscription_id == sub_entity["id"]
-    ).first()
+    ).with_for_update().first()
     if team_sub and team_sub.status == "active":
         team_sub.status = "pending"
         db.commit()

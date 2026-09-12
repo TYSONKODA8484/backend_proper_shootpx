@@ -13,6 +13,7 @@ from app.services.billing import (
     create_subscription_checkout,
     cancel_subscription,
     RazorpayCancelError,
+    switch_subscription
 )
 router = APIRouter(prefix="/billing", tags=["checkout"])
 
@@ -73,3 +74,23 @@ def cancel_team_subscription(
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"status": "cancelled", "teamId": str(team_id)}
+
+
+@router.post("/teams/{team_id}/subscriptions/{new_subscription_id}/switch")
+@limiter.limit("10/minute")
+def switch_team_subscription(
+    request: Request,
+    team_id: UUID,
+    new_subscription_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not is_team_owner(db, team_id, user.id):
+        raise HTTPException(status_code=403, detail="Only the team owner can switch plans")
+
+    try:
+        checkout = switch_subscription(db, team_id, new_subscription_id)
+    except (ValueError, RazorpayCancelError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return checkout

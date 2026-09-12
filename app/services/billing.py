@@ -9,6 +9,7 @@ from app.models.credit import Credit
 from app.models.subscription import Subscription
 from app.models.team_subscription import TeamSubscription
 from app.core.config import settings
+from app.models.team import Team
 
 logger = logging.getLogger(__name__)
 
@@ -151,3 +152,22 @@ def cancel_subscription(db: Session, team_id) -> TeamSubscription:
     db.commit()
     return team_sub
 
+def switch_subscription(db: Session, team_id, new_subscription_id) -> dict:
+    new_plan = db.query(Subscription).filter(Subscription.id == new_subscription_id).first()
+    if not new_plan:
+        raise ValueError("New plan not found")
+    if not new_plan.razorpay_plan_id:
+        raise ValueError("This plan is not configured for payment yet")
+
+    cancel_subscription(db, team_id)
+
+    team = db.query(Team).filter(Team.id == team_id).with_for_update().first()
+    if not team:
+        raise ValueError("Team not found")
+
+    leftover = team.subscription_credits_remaining
+    team.topup_credits_balance += leftover
+    team.subscription_credits_remaining = 0
+    db.commit()
+
+    return create_subscription_checkout(db, team_id, new_subscription_id)

@@ -17,13 +17,28 @@ def _run(coro):
 # --------------------------------------------------------------------------- #
 
 def _refill_db(due=(), plan=None, lapse_due=(), team_for_update=None):
+    """The active pass now makes TWO kinds of TeamSubscription query per row:
+    the batch query at the top of the function (1st call), then a per-row
+    re-fetch-by-id under .with_for_update() inside the loop (each subsequent
+    call, in the same order the loop iterates `due`). A counter over
+    db.query(TeamSubscription) calls tells them apart instead of trying to
+    parse the actual SQLAlchemy filter expression."""
     db = MagicMock()
+    due = list(due)
+    seen = {"team_sub_calls": 0}
 
     def query(model):
         q = MagicMock()
         name = getattr(model, "__name__", "")
         if name == "TeamSubscription":
-            q.filter.return_value.all.return_value = list(due)              # active pass
+            seen["team_sub_calls"] += 1
+            call_index = seen["team_sub_calls"]
+            if call_index == 1:
+                q.filter.return_value.all.return_value = due                # the batch query
+            else:
+                row_index = call_index - 2
+                row = due[row_index] if 0 <= row_index < len(due) else None
+                q.filter.return_value.with_for_update.return_value.first.return_value = row
             q.join.return_value.filter.return_value.all.return_value = list(lapse_due)  # lapse pass
         elif name == "Subscription":
             q.filter.return_value.first.return_value = plan
@@ -43,7 +58,7 @@ def test_refill_refills_and_advances_from_now(monkeypatch):
         lambda db, team_id, amount, commit=True: calls.append((team_id, amount, commit)),
     )
     stale = datetime(2020, 1, 1, tzinfo=timezone.utc)   # years overdue
-    ts = MagicMock(team_id="team-1", subscription_id="sub-1",
+    ts = MagicMock(team_id="team-1", subscription_id="sub-1", status="active",
                    credits_per_refill=1000, next_refill_at=stale)
     db = _refill_db([ts], MagicMock(period_label="year"))
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
@@ -62,7 +77,7 @@ def test_refill_refills_and_advances_from_now(monkeypatch):
 def test_refill_step_per_period(monkeypatch):
     monkeypatch.setattr(worker, "refill_subscription_credits", lambda *a, **k: None)
     for label, lo, hi in [("week", 6, 8), ("month", 29, 31), ("year", 29, 31)]:
-        ts = MagicMock(team_id="t", subscription_id="s", credits_per_refill=10,
+        ts = MagicMock(team_id="t", subscription_id="s", status="active", credits_per_refill=10,
                        next_refill_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
         db = _refill_db([ts], MagicMock(period_label=label))
         monkeypatch.setattr(worker, "SessionLocal", lambda: db)
@@ -77,9 +92,9 @@ def test_refill_one_failure_does_not_abort_the_batch(monkeypatch):
             raise ValueError("Team not found")
 
     monkeypatch.setattr(worker, "refill_subscription_credits", refill)
-    bad = MagicMock(team_id="bad", subscription_id="s", credits_per_refill=10,
+    bad = MagicMock(team_id="bad", subscription_id="s", status="active", credits_per_refill=10,
                     next_refill_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
-    good = MagicMock(team_id="good", subscription_id="s", credits_per_refill=10,
+    good = MagicMock(team_id="good", subscription_id="s", status="active", credits_per_refill=10,
                      next_refill_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
     db = _refill_db([bad, good], MagicMock(period_label="week"))
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
@@ -253,6 +268,7 @@ def _pending_event(sub_id="sub_x"):
 def _pending_db(team_sub):
     db = MagicMock()
     db.query.return_value.filter.return_value.first.return_value = team_sub
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = team_sub
     return db
 
 
