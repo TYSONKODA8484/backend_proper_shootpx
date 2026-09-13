@@ -11,7 +11,7 @@ from app.core.limiter import limiter
 from app.deps import get_current_user
 from app.models.user import User
 from app.services.teams import is_team_member
-from app.services.generation import create_generation_job, fail_and_release, handle_fal_webhook
+from app.services.generation import create_generation_batch, fail_and_release, handle_fal_webhook
 from app.models.generation_job import GenerationJob
 from app.core.arq_pool import get_arq_pool
 
@@ -22,6 +22,7 @@ class GenerateRequest(BaseModel):
     team_id: UUID
     feature_type: str
     input_params: dict = {}
+    output_count: int = 1
 
 
 @router.post("/generate")
@@ -36,22 +37,28 @@ async def generate(
         raise HTTPException(status_code=403, detail="You are not a member of this team")
 
     try:
-        job = create_generation_job(db, payload.team_id, user.id, payload.feature_type, payload.input_params)
+        jobs = create_generation_batch(
+            db, payload.team_id, user.id, payload.feature_type,
+            payload.input_params, payload.output_count,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
         pool = await get_arq_pool()
-        await pool.enqueue_job("submit_generation_to_fal", str(job.id))
+        for job in jobs:
+            await pool.enqueue_job("submit_generation_to_fal", str(job.id))
     except Exception:
-        # The job row + charge already committed inside create_generation_job.
-        # If it can't even be enqueued (Redis/arq unreachable), it must not be
-        # left stuck 'queued' forever with credits spent and nothing to ever
-        # process it -- fail it and refund immediately instead.
-        fail_and_release(db, job, "Failed to enqueue generation for processing")
+        # Same enqueue-failure protection as before, now applied per job
+        # in the batch — none of them can be left stuck queued forever.
+        for job in jobs:
+            fail_and_release(db, job, "Failed to enqueue generation for processing")
         raise HTTPException(status_code=503, detail="Failed to start generation. Please try again.")
 
-    return {"jobId": str(job.id), "status": job.status}
+    return {
+        "batchId": str(jobs[0].batch_id),
+        "jobs": [{"jobId": str(j.id), "status": j.status} for j in jobs],
+    }
 
 
 @router.get("/jobs/{job_id}")
@@ -78,6 +85,30 @@ def get_job(
     }
 
 
+@router.get("/batches/{batch_id}")
+@limiter.limit("60/minute")
+def get_batch(
+    batch_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    jobs = db.query(GenerationJob).filter(GenerationJob.batch_id == batch_id).all()
+    if not jobs:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    if not is_team_member(db, jobs[0].team_id, user.id):
+        raise HTTPException(status_code=403, detail="You are not a member of this team")
+
+    return {
+        "batchId": str(batch_id),
+        "jobs": [
+            {"jobId": str(j.id), "status": j.status, "outputUrl": j.output_url, "errorMessage": j.error_message}
+            for j in jobs
+        ],
+    }
+
+
 @router.post("/webhooks/fal")
 async def fal_webhook(request: Request, job_id: UUID, db: Session = Depends(get_db)):
     raw_body = await request.body()
@@ -90,4 +121,3 @@ async def fal_webhook(request: Request, job_id: UUID, db: Session = Depends(get_
     payload = json.loads(raw_body)
     handle_fal_webhook(db, job_id, payload)
     return {"status": "ok"}
-
