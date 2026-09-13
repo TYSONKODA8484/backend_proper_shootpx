@@ -27,10 +27,11 @@ def _job(status="queued", credits_charged=5, from_sub=3, from_topup=2):
     )
 
 
-def _webhook_db(job):
+def _webhook_db(job, remaining_in_batch=0):
     db = MagicMock()
     (db.query.return_value.filter.return_value
        .with_for_update.return_value.first.return_value) = job
+    db.query.return_value.filter.return_value.count.return_value = remaining_in_batch
     return db
 
 
@@ -87,9 +88,13 @@ def test_empty_images_array_fails_and_refunds(monkeypatch):
     upload.assert_not_called()
 
 
-def test_download_failure_fails_and_refunds_with_correct_message(monkeypatch):
-    """Regression test: the download failure used to be mislabeled as a
-    'Storage upload failed' error even though upload was never reached."""
+def test_download_failure_fails_refunds_with_generic_message_and_logs_real_error(monkeypatch, caplog):
+    """Restores the download-vs-upload distinction, but learns the FAL_KEY
+    lesson from earlier: job.error_message (user-facing via GET /jobs/{id})
+    must never contain raw exception text, ever -- not even redacted. Instead
+    it's one of two fixed, generic-but-distinct strings, and the real
+    exception detail goes to the server log via logger.exception(), never to
+    the client."""
     job = _job(credits_charged=5, from_sub=3, from_topup=2)
     db = _webhook_db(job)
     monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
@@ -100,16 +105,20 @@ def test_download_failure_fails_and_refunds_with_correct_message(monkeypatch):
     refund = MagicMock()
     monkeypatch.setattr(generation_svc, "refund_credits", refund)
 
-    generation_svc.handle_fal_webhook(db, uuid.uuid4(), _ok_payload())
+    with caplog.at_level("ERROR", logger="app.services.generation"):
+        generation_svc.handle_fal_webhook(db, uuid.uuid4(), _ok_payload())
 
     assert job.status == "failed"
-    assert "download" in job.error_message.lower()
+    assert job.error_message == "Could not retrieve the generated image. Please try again."
     assert "upload" not in job.error_message.lower()
+    assert "fal temp URL expired (404)" not in job.error_message  # never leaks raw exception text
     refund.assert_called_once_with(db, job.team_id, 5, 3, 2)
     upload.assert_not_called()  # never reached
+    assert "fal temp URL expired (404)" in caplog.text  # but IS logged server-side for debugging
+    assert any(r.exc_info for r in caplog.records)  # logger.exception, not logger.error
 
 
-def test_upload_failure_fails_and_refunds_with_correct_message(monkeypatch):
+def test_upload_failure_fails_refunds_with_generic_message_and_logs_real_error(monkeypatch, caplog):
     job = _job(credits_charged=5, from_sub=3, from_topup=2)
     db = _webhook_db(job)
     monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
@@ -119,11 +128,21 @@ def test_upload_failure_fails_and_refunds_with_correct_message(monkeypatch):
     refund = MagicMock()
     monkeypatch.setattr(generation_svc, "refund_credits", refund)
 
-    generation_svc.handle_fal_webhook(db, uuid.uuid4(), _ok_payload())
+    with caplog.at_level("ERROR", logger="app.services.generation"):
+        generation_svc.handle_fal_webhook(db, uuid.uuid4(), _ok_payload())
 
     assert job.status == "failed"
-    assert "upload" in job.error_message.lower()
+    assert job.error_message == "Could not save the generated image. Please try again."
+    assert "bucket permission denied" not in job.error_message
     refund.assert_called_once_with(db, job.team_id, 5, 3, 2)
+    assert "bucket permission denied" in caplog.text
+    assert any(r.exc_info for r in caplog.records)
+
+
+def test_download_and_upload_failures_use_distinct_messages():
+    """The two messages must actually differ -- that's the whole point."""
+    from app.services.generation import DOWNLOAD_FAILED_MESSAGE, UPLOAD_FAILED_MESSAGE
+    assert DOWNLOAD_FAILED_MESSAGE != UPLOAD_FAILED_MESSAGE
 
 
 # --------------------------------------------------------------------------- #
@@ -162,7 +181,7 @@ def test_replay_after_terminal_never_touches_storage_or_refunds_again(monkeypatc
 def test_permanent_path_uses_only_uuid_and_admin_controlled_feature_type(monkeypatch):
     """team_id and job.id are always real UUIDs (no traversal characters
     possible), and feature_type can only ever be a value that already exists
-    as a primary key in tool_definitions (admin-controlled) -- create_generation_job
+    as a primary key in tool_definitions (admin-controlled) -- create_generation_batch
     rejects any feature_type that isn't already a real row. Confirmed here by
     showing the exact composed path is exactly the 4 expected safe segments."""
     job = _job()
@@ -191,7 +210,7 @@ def test_permanent_path_uses_only_uuid_and_admin_controlled_feature_type(monkeyp
     "team/feature/job/output.png\x00.jpg",
 ])
 def test_upload_to_storage_rejects_path_traversal(malicious_path):
-    """Defense in depth: feature_type is admin-gated today (create_generation_job
+    """Defense in depth: feature_type is admin-gated today (create_generation_batch
     rejects any feature_type not already a tool_definitions row), so this isn't
     reachable through the current API -- but upload_to_storage is the actual
     security boundary that touches external storage, so it must not blindly

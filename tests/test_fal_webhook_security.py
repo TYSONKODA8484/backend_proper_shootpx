@@ -213,6 +213,7 @@ def test_webhook_route_accepts_valid_signature(webhook_client, monkeypatch):
     job = MagicMock(status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4())
     (db.query.return_value.filter.return_value
        .with_for_update.return_value.first.return_value) = job
+    db.query.return_value.filter.return_value.count.return_value = 0  # last (only) job in its batch
     monkeypatch.setattr("app.services.generation.release_generation_lock", lambda uid: None)
     monkeypatch.setattr("app.services.generation.download_from_url", lambda url: b"bytes")
     monkeypatch.setattr("app.services.generation.upload_to_storage",
