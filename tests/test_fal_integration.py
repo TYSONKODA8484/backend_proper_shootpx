@@ -49,7 +49,7 @@ def gen_client():
 
 def test_generate_cleans_up_when_arq_enqueue_fails(gen_client, monkeypatch):
     """Reproduces the real bug found live against the dev DB: get_arq_pool()
-    (or enqueue_job) raising after create_generation_job already committed
+    (or enqueue_job) raising after create_generation_batch already committed
     left credits permanently spent, the job stuck in 'queued' forever, and
     the per-user lock held, with nothing ever going to process it."""
     client, fake_user, db = gen_client
@@ -57,7 +57,11 @@ def test_generate_cleans_up_when_arq_enqueue_fails(gen_client, monkeypatch):
 
     job = MagicMock(id=uuid.uuid4(), status="queued", team_id=TEAM_ID, user_id=fake_user.id,
                      credits_charged=5, credits_from_subscription=3, credits_from_topup=2)
-    monkeypatch.setattr("app.routes.generation.create_generation_job", MagicMock(return_value=job))
+    monkeypatch.setattr("app.routes.generation.create_generation_batch", MagicMock(return_value=[job]))
+    # fail_and_release counts remaining queued/processing siblings in the
+    # batch to decide whether to release the lock; 0 here since this is a
+    # single-job batch with nothing else in flight.
+    db.query.return_value.filter.return_value.count.return_value = 0
 
     refund = MagicMock()
     release = MagicMock()

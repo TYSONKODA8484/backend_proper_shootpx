@@ -1,20 +1,32 @@
+import logging
+import uuid
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
-from app.core.arq_pool import get_arq_pool
 from app.models.generation_job import GenerationJob
 from app.models.tool_definition import ToolDefinition
 from app.services.generation_lock import acquire_generation_lock, release_generation_lock
 from app.services.credits import spend_credits, refund_credits
+from app.core.storage import upload_to_storage, download_from_url
+
+logger = logging.getLogger(__name__)
+
+# job.error_message is returned verbatim to any team member via GET /jobs/{id}
+# and GET /batches/{id} -- these must always be fixed, generic strings, never
+# raw exception text (that lesson came from a real FAL_KEY leak found earlier
+# in this pipeline's audit). The real exception detail is logged server-side
+# via logger.exception() instead, distinguishing the two failure points so
+# support/ops can tell a dead fal.ai temp URL apart from a broken storage
+# bucket without ever exposing either to the client.
+DOWNLOAD_FAILED_MESSAGE = "Could not retrieve the generated image. Please try again."
+UPLOAD_FAILED_MESSAGE = "Could not save the generated image. Please try again."
 
 
-def create_generation_job(db: Session, team_id, user_id, feature_type: str, input_params: dict) -> GenerationJob:
-    # 1. Lock check — one generation at a time, per person
+def create_generation_batch(db: Session, team_id, user_id, feature_type: str, input_params: dict, output_count: int = 1) -> list[GenerationJob]:
     if not acquire_generation_lock(user_id):
         raise ValueError("You already have a generation in progress. Please wait for it to finish.")
 
     try:
-        # 2. Look up the tool's real definition (not the frontend display table)
         tool = db.query(ToolDefinition).filter(
             ToolDefinition.feature_type == feature_type
         ).first()
@@ -23,76 +35,113 @@ def create_generation_job(db: Session, team_id, user_id, feature_type: str, inpu
         if not tool.is_active:
             raise ValueError("This tool is not currently available")
 
-        # 3. Charge credits BEFORE calling fal.ai — this is the "reservation"
-        #    from the credits design. If fal.ai fails, this gets refunded.
-        #    commit=False: the spend and the job row below must land in the
-        #    same transaction, otherwise a failure creating the job would
-        #    leave credits spent with no job row to ever refund them from.
-        _, from_subscription, from_topup = spend_credits(db, team_id, tool.credit_cost_per_output, commit=False)
+        output_count = output_count if output_count and output_count > 0 else tool.default_output_count
+        total_cost = tool.credit_cost_per_output * output_count
 
-        # 4. Create the job row — records exactly which pools were charged,
-        #    so a later refund (if this job fails) is always exact, never guessed.
-        job = GenerationJob(
-            team_id=team_id,
-            user_id=user_id,
-            feature_type=feature_type,
-            input_params=input_params,
-            credits_charged=tool.credit_cost_per_output,
-            credits_from_subscription=from_subscription,
-            credits_from_topup=from_topup,
-            status="queued",
-        )
-        db.add(job)
+        _, from_subscription, from_topup = spend_credits(db, team_id, total_cost, commit=False)
+
+        per_job_sub = from_subscription // output_count
+        per_job_top = from_topup // output_count
+        remainder_sub = from_subscription - (per_job_sub * output_count)
+        remainder_top = from_topup - (per_job_top * output_count)
+
+        batch_id = uuid.uuid4()
+        jobs = []
+
+        for i in range(output_count):
+            job = GenerationJob(
+                team_id=team_id,
+                user_id=user_id,
+                feature_type=feature_type,
+                input_params=input_params,
+                batch_id=batch_id,
+                credits_charged=tool.credit_cost_per_output,
+                credits_from_subscription=per_job_sub + (remainder_sub if i == 0 else 0),
+                credits_from_topup=per_job_top + (remainder_top if i == 0 else 0),
+                status="queued",
+            )
+            db.add(job)
+            jobs.append(job)
+
         db.commit()
-
-        # 5. STUB — real fal.ai call comes in Part 2. For now, just simulate
-        #    "submitted successfully" so the pipeline can be tested end to end.
-        # TODO: replace with real fal.ai submit + webhook URL
-
-        return job
+        return jobs
 
     except Exception:
-        # Roll back so a failed job insert can never leave the just-spent
-        # credits committed with no job row to account for them.
         db.rollback()
-        # If anything above fails (credit issue, tool lookup, etc.), release
-        # the lock immediately — don't leave the person stuck for 5 minutes
-        # over an error that happened before any real job started.
         release_generation_lock(user_id)
         raise
 
 
 def fail_and_release(db: Session, job: GenerationJob, error_message: str) -> None:
-    """Mark a job failed, refund its exact charged split, and release the
-    lock. Used when a job could not even be enqueued for processing (e.g.
-    arq/Redis unreachable right after /generate created it) so it's never
-    left stuck 'queued' forever with credits already spent, a lock held, and
-    nothing ever going to process it."""
+    """
+    Used when a job was created and charged, but something after that point
+    failed before fal.ai was ever reached (e.g. arq/Redis unreachable at
+    enqueue time). Marks the job failed, refunds using its own exact stored
+    split, releases the lock if this was the last job in its batch.
+    """
     job.status = "failed"
     job.error_message = error_message
     refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
+    job.completed_at = datetime.now(timezone.utc)
+
+    remaining = db.query(GenerationJob).filter(
+        GenerationJob.batch_id == job.batch_id,
+        GenerationJob.status.in_(("queued", "processing")),
+    ).count()
+
+    if remaining <= 1:
+        release_generation_lock(job.user_id)
+
     db.commit()
-    release_generation_lock(job.user_id)
 
 
 def handle_fal_webhook(db: Session, job_id, payload: dict):
     job = db.query(GenerationJob).filter(GenerationJob.id == job_id).with_for_update().first()
     if not job:
-        return  # unknown job, ignore safely
+        return
 
     if job.status in ("completed", "failed"):
-        return  # already processed — idempotency guard, same pattern as every webhook tonight
-
-    release_generation_lock(job.user_id)
+        return
 
     if payload.get("status") == "OK":
         images = payload.get("payload", {}).get("images", [])
-        job.output_url = images[0]["url"] if images else None
-        job.status = "completed"
+        fal_url = images[0]["url"] if images else None
+
+        if fal_url:
+            try:
+                file_bytes = download_from_url(fal_url)
+            except Exception:
+                logger.exception("Failed to download fal.ai output for job %s", job.id)
+                job.status = "failed"
+                job.error_message = DOWNLOAD_FAILED_MESSAGE
+                refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
+            else:
+                try:
+                    permanent_path = f"{job.team_id}/{job.feature_type}/{job.id}/output.png"
+                    job.output_url = upload_to_storage(permanent_path, file_bytes)
+                    job.status = "completed"
+                except Exception:
+                    logger.exception("Failed to upload output to storage for job %s", job.id)
+                    job.status = "failed"
+                    job.error_message = UPLOAD_FAILED_MESSAGE
+                    refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
+        else:
+            job.status = "failed"
+            job.error_message = "fal reported success but returned no image"
+            refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
     else:
         job.status = "failed"
         job.error_message = payload.get("error", "Generation failed")
         refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
 
     job.completed_at = datetime.now(timezone.utc)
+
+    remaining = db.query(GenerationJob).filter(
+        GenerationJob.batch_id == job.batch_id,
+        GenerationJob.status.in_(("queued", "processing")),
+    ).count()
+
+    if remaining <= 1:
+        release_generation_lock(job.user_id)
+
     db.commit()
