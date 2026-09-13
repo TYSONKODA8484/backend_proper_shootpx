@@ -36,9 +36,18 @@ async def refill_due_subscriptions(ctx):
 
     for team_sub in due:
         try:
+            # populate_existing() is required: team_sub (same id) is already
+            # in this session's identity map from the unlocked `due` query
+            # above. Without it, SQLAlchemy returns the SAME cached object
+            # with its stale pre-lock status/next_refill_at instead of the
+            # fresh row FOR UPDATE just fetched, so this re-check would
+            # silently pass on data from before the lock -- a subscription
+            # cancelled by a concurrent webhook moments earlier would still
+            # read as 'active' here and get refilled anyway. Same root cause
+            # found and fixed in sweep_stale_generation_jobs during today's audit.
             locked_sub = db.query(TeamSubscription).filter(
                 TeamSubscription.id == team_sub.id
-            ).with_for_update().first()
+            ).populate_existing().with_for_update().first()
 
             if not locked_sub or locked_sub.status != "active":
                 continue
@@ -157,6 +166,56 @@ async def submit_generation_to_fal(ctx, job_id: str):
         db.close()
 
 
+async def sweep_stale_generation_jobs(ctx):
+    """
+    Catches jobs stuck in queued/processing for too long — a crashed worker,
+    a lost webhook, or fal.ai never responding. Marks them failed and refunds.
+    """
+    db = SessionLocal()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    stale = db.query(GenerationJob).filter(
+        GenerationJob.status.in_(["queued", "processing"]),
+        GenerationJob.created_at <= cutoff,
+    ).all()
+
+    for job in stale:
+        try:
+            # populate_existing() is required here: `job` (and therefore this
+            # same id) is already in this session's identity map from the
+            # unlocked query above. Without it, SQLAlchemy returns the SAME
+            # cached Python object with its stale pre-lock attributes instead
+            # of refreshing them from the row FOR UPDATE just fetched, so the
+            # status re-check below would silently pass on data from before
+            # the lock was ever acquired -- a real webhook completing this
+            # exact job while the sweep is mid-flight would go undetected and
+            # get double-refunded. Confirmed live: without this, a job a
+            # webhook had already marked 'completed' still read as
+            # 'processing' here, moments after the webhook committed.
+            locked_job = db.query(GenerationJob).filter(
+                GenerationJob.id == job.id
+            ).populate_existing().with_for_update().first()
+
+            if not locked_job or locked_job.status not in ("queued", "processing"):
+                continue  # already resolved by the time we got the lock
+
+            locked_job.status = "failed"
+            locked_job.error_message = "Generation timed out — no response received"
+            refund_credits(
+                db, locked_job.team_id, locked_job.credits_charged,
+                locked_job.credits_from_subscription, locked_job.credits_from_topup,
+            )
+            locked_job.completed_at = datetime.now(timezone.utc)
+            db.commit()
+            release_generation_lock(locked_job.user_id)
+            logger.info("Swept stale job %s (was stuck since %s)", locked_job.id, locked_job.created_at)
+        except Exception:
+            db.rollback()
+            logger.exception("failed to sweep job %s — will retry next run", job.id)
+
+    db.close()
+
+
 async def startup(ctx):
     logger.info("arq worker started")
 
@@ -170,10 +229,12 @@ class WorkerSettings:
         refill_due_subscriptions,
         cleanup_stale_pending_subscriptions,
         submit_generation_to_fal,
+        sweep_stale_generation_jobs,
     ]
     cron_jobs = [
         cron(refill_due_subscriptions, hour=3, minute=0),
         cron(cleanup_stale_pending_subscriptions, hour=4, minute=0),
+        cron(sweep_stale_generation_jobs, minute={0, 15, 30, 45}),
     ]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
 
