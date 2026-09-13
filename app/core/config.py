@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     razorpay_key_id: str
     razorpay_key_secret: str
     razorpay_webhook_secret: str
+    fal_key: str
+    public_backend_url: str
+    supabase_url: str
+    supabase_service_role_key: str
 
     @property
     def cors_origins_list(self) -> list[str]:

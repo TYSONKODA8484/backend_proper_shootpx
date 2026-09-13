@@ -31,10 +31,19 @@ class FakePlan:
     period_label = "month"
     credits = 350
     razorpay_plan_id = REAL_PLAN_ID
+    is_active = True
+    # Mirrors the hardcoded {"week": 52, "month": 12, "year": 1}["month"] that
+    # create_subscription_checkout actually sends to Razorpay. Nothing in the
+    # codebase enforces this match — see test_charged_renewal_notice tests.
+    total_count = 12
 
 
 class FakePlanUnconfigured(FakePlan):
     razorpay_plan_id = None
+
+
+class FakePlanRetired(FakePlan):
+    is_active = False
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +191,22 @@ def test_subscription_checkout_rejects_unconfigured_plan(sub_client):
     res = client.post(_url(), headers={"Authorization": "Bearer x"})
     assert res.status_code == 400
     assert state["created"] == []
+
+
+def test_subscription_checkout_currently_allows_retired_plan(sub_client):
+    """KNOWN GAP, not a pass/fail expectation: create_subscription_checkout only
+    checks the plan exists and has a razorpay_plan_id. It never checks
+    is_active, so someone who already has a retired plan's UUID (an old
+    bookmark, a stale frontend cache, a direct API call) can still start a
+    real checkout against it even though GET /landing/billing no longer lists
+    it for new visitors. This test documents today's actual behaviour
+    (succeeds) rather than asserting it's correct — whether retired plans
+    should be checkout-blockable is a product decision, not made here."""
+    client, state, db = sub_client
+    state["plan"] = FakePlanRetired()
+    res = client.post(_url(), headers={"Authorization": "Bearer x"})
+    assert res.status_code == 200
+    assert len(state["created"]) == 1
 
 
 def test_subscription_checkout_requires_owner(sub_client, monkeypatch):
@@ -467,3 +492,171 @@ def test_halted_and_cancelled_set_status(monkeypatch):
         handler(db, _sub_event(kind))
         assert team_sub.status == expected
         db.commit.assert_called()
+
+
+# --------------------------------------------------------------------------- #
+# subscription.completed webhook (Case 2 — plan retirement / natural end)
+# --------------------------------------------------------------------------- #
+
+def test_completed_transitions_active_to_cancelled():
+    team_sub = MagicMock(status="active")
+    db = _charged_db(team_sub, FakePlan())
+    webhooks_svc.handle_subscription_completed(db, _sub_event("subscription.completed"))
+    assert team_sub.status == "cancelled"
+    db.commit.assert_called_once()
+
+
+def test_completed_noops_on_any_non_active_status():
+    for status in ("pending", "cancelled", "halted"):
+        team_sub = MagicMock(status=status)
+        db = _charged_db(team_sub, FakePlan())
+        webhooks_svc.handle_subscription_completed(db, _sub_event("subscription.completed"))
+        assert team_sub.status == status           # unchanged
+        db.commit.assert_not_called()
+
+
+def test_completed_noop_when_no_row():
+    db = _charged_db(None, FakePlan())
+    webhooks_svc.handle_subscription_completed(db, _sub_event("subscription.completed"))
+    db.commit.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# renewal-notice email inside handle_subscription_charged
+# --------------------------------------------------------------------------- #
+
+def _charged_db_with_team(team_sub, plan, owner_membership=None, owner_user=None):
+    db = MagicMock()
+
+    def query(model):
+        q = MagicMock()
+        name = getattr(model, "__name__", "")
+        if name == "TeamSubscription":
+            q.filter.return_value.first.return_value = team_sub
+            q.filter.return_value.with_for_update.return_value.first.return_value = team_sub
+        elif name == "Subscription":
+            q.filter.return_value.first.return_value = plan
+        elif name == "TeamMember":
+            q.filter.return_value.first.return_value = owner_membership
+        elif name == "User":
+            q.filter.return_value.first.return_value = owner_user
+        return q
+
+    db.query.side_effect = query
+    return db
+
+
+def test_renewal_notice_fires_on_second_to_last_charge(monkeypatch):
+    sent = []
+    monkeypatch.setattr(webhooks_svc, "send_email", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(webhooks_svc, "refill_subscription_credits", lambda *a, **k: None)
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.subscription, "fetch",
+        lambda sid: {"id": sid, "paid_count": 11},   # plan.total_count(12) - 1
+    )
+    plan = FakePlan()
+    team_sub = MagicMock(team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+                         credits_per_refill=350, last_paid_count=10, status="active")
+    membership = MagicMock(user_id="user-1")
+    owner = MagicMock(email="owner@example.com")
+    db = _charged_db_with_team(team_sub, plan, owner_membership=membership, owner_user=owner)
+
+    webhooks_svc.handle_subscription_charged(db, _sub_event("subscription.charged"))
+
+    assert len(sent) == 1
+    assert sent[0]["to"] == "owner@example.com"
+    assert team_sub.last_paid_count == 11
+
+
+def test_renewal_notice_does_not_fire_on_other_paid_counts(monkeypatch):
+    sent = []
+    monkeypatch.setattr(webhooks_svc, "send_email", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(webhooks_svc, "refill_subscription_credits", lambda *a, **k: None)
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.subscription, "fetch",
+        lambda sid: {"id": sid, "paid_count": 5},
+    )
+    plan = FakePlan()
+    team_sub = MagicMock(team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+                         credits_per_refill=350, last_paid_count=4, status="active")
+    membership = MagicMock(user_id="user-1")
+    owner = MagicMock(email="owner@example.com")
+    db = _charged_db_with_team(team_sub, plan, owner_membership=membership, owner_user=owner)
+
+    webhooks_svc.handle_subscription_charged(db, _sub_event("subscription.charged"))
+
+    assert sent == []
+
+
+def test_renewal_notice_does_not_refire_on_redelivered_webhook(monkeypatch):
+    """Nested inside the same paid_count > last_paid_count guard that protects
+    the refill: a redelivery of the exact event that already sent the notice
+    must not send it a second time."""
+    sent = []
+    monkeypatch.setattr(webhooks_svc, "send_email", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(webhooks_svc, "refill_subscription_credits", lambda *a, **k: None)
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.subscription, "fetch",
+        lambda sid: {"id": sid, "paid_count": 11},
+    )
+    plan = FakePlan()
+    team_sub = MagicMock(team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+                         credits_per_refill=350, last_paid_count=10, status="active")
+    membership = MagicMock(user_id="user-1")
+    owner = MagicMock(email="owner@example.com")
+    db = _charged_db_with_team(team_sub, plan, owner_membership=membership, owner_user=owner)
+    event = _sub_event("subscription.charged")
+
+    webhooks_svc.handle_subscription_charged(db, event)   # first delivery -> sends
+    webhooks_svc.handle_subscription_charged(db, event)   # redelivered -> must not resend
+
+    assert len(sent) == 1
+
+
+def test_renewal_notice_skips_gracefully_when_no_owner_found(monkeypatch):
+    sent = []
+    monkeypatch.setattr(webhooks_svc, "send_email", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(webhooks_svc, "refill_subscription_credits", lambda *a, **k: None)
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.subscription, "fetch",
+        lambda sid: {"id": sid, "paid_count": 11},
+    )
+    plan = FakePlan()
+    team_sub = MagicMock(team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+                         credits_per_refill=350, last_paid_count=10, status="active")
+    db = _charged_db_with_team(team_sub, plan, owner_membership=None, owner_user=None)
+
+    # must not raise even though no TeamMember/User row exists
+    webhooks_svc.handle_subscription_charged(db, _sub_event("subscription.charged"))
+
+    assert sent == []
+    assert team_sub.last_paid_count == 11    # the rest of the charge still processed
+
+
+def test_renewal_notice_never_fires_for_yearly_plans(monkeypatch):
+    """Yearly renewals never enter the `period_label != 'year'` branch at all
+    (that's what gates BOTH the refill and the notice), so the notice can
+    never fire for a yearly plan through this code path — confirmed safe (no
+    crash, no misfire), though it does mean yearly owners get no 'ending soon'
+    notice via this mechanism at all."""
+    sent = []
+    monkeypatch.setattr(webhooks_svc, "send_email", lambda **kw: sent.append(kw))
+    refills = []
+    monkeypatch.setattr(webhooks_svc, "refill_subscription_credits",
+                        lambda *a, **k: refills.append(a))
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.subscription, "fetch",
+        lambda sid: {"id": sid, "paid_count": 1},   # yearly's only ever charge
+    )
+    plan = FakePlan()
+    plan.period_label = "year"
+    plan.total_count = 1
+    team_sub = MagicMock(team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+                         credits_per_refill=1000, last_paid_count=0, status="active")
+    db = _charged_db_with_team(team_sub, plan)
+
+    webhooks_svc.handle_subscription_charged(db, _sub_event("subscription.charged"))
+
+    assert sent == []
+    assert refills == []                  # yearly refills are the scheduler's job, not this webhook
+    assert team_sub.last_paid_count == 1  # idempotency counter still advances correctly

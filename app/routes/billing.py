@@ -27,7 +27,7 @@ def get_billing(request: Request, db: Session = Depends(get_db)):
 
     try:
         subs = db.execute(
-            select(Subscription).order_by(Subscription.sort_order)
+            select(Subscription).where(Subscription.is_active == True).order_by(Subscription.sort_order)
         ).scalars().all()
 
         packs = db.execute(
