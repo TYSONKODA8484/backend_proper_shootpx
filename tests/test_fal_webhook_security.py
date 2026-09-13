@@ -214,6 +214,9 @@ def test_webhook_route_accepts_valid_signature(webhook_client, monkeypatch):
     (db.query.return_value.filter.return_value
        .with_for_update.return_value.first.return_value) = job
     monkeypatch.setattr("app.services.generation.release_generation_lock", lambda uid: None)
+    monkeypatch.setattr("app.services.generation.download_from_url", lambda url: b"bytes")
+    monkeypatch.setattr("app.services.generation.upload_to_storage",
+                         lambda path, data: "https://our-storage.test/permanent/a.png")
 
     job_id = uuid.uuid4()
     body = json.dumps({"status": "OK", "payload": {"images": [{"url": "https://x.test/a.png"}]}}).encode()

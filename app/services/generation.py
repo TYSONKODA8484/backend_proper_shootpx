@@ -2,10 +2,22 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.core.arq_pool import get_arq_pool
+from app.core.config import settings
 from app.models.generation_job import GenerationJob
 from app.models.tool_definition import ToolDefinition
 from app.services.generation_lock import acquire_generation_lock, release_generation_lock
 from app.services.credits import spend_credits, refund_credits
+from app.core.storage import upload_to_storage, download_from_url
+
+
+def _redact_secrets(error: Exception) -> str:
+    """job.error_message is returned to any team member via GET /jobs/{id};
+    real fal.ai/Supabase exceptions never include these, but this is defense
+    in depth against a future exception type that did."""
+    text = str(error)
+    for secret in (settings.fal_key, settings.supabase_service_role_key):
+        text = text.replace(secret, "[REDACTED]")
+    return text
 
 
 def create_generation_job(db: Session, team_id, user_id, feature_type: str, input_params: dict) -> GenerationJob:
@@ -87,8 +99,28 @@ def handle_fal_webhook(db: Session, job_id, payload: dict):
 
     if payload.get("status") == "OK":
         images = payload.get("payload", {}).get("images", [])
-        job.output_url = images[0]["url"] if images else None
-        job.status = "completed"
+        fal_url = images[0]["url"] if images else None
+
+        if fal_url:
+            try:
+                file_bytes = download_from_url(fal_url)
+            except Exception as e:
+                job.status = "failed"
+                job.error_message = f"Download from fal failed: {_redact_secrets(e)}"
+                refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
+            else:
+                try:
+                    permanent_path = f"{job.team_id}/{job.feature_type}/{job.id}/output.png"
+                    job.output_url = upload_to_storage(permanent_path, file_bytes)
+                    job.status = "completed"
+                except Exception as e:
+                    job.status = "failed"
+                    job.error_message = f"Storage upload failed: {_redact_secrets(e)}"
+                    refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
+        else:
+            job.status = "failed"
+            job.error_message = "fal reported success but returned no image"
+            refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
     else:
         job.status = "failed"
         job.error_message = payload.get("error", "Generation failed")

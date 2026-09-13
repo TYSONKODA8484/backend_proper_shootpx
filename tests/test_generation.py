@@ -219,10 +219,16 @@ def _webhook_db(job):
 
 
 def test_webhook_success_completes_job_and_releases_lock(monkeypatch):
+    """Storage integration (see tests/test_storage_integration.py for the full
+    download/upload matrix): output_url ends up as OUR permanent storage URL,
+    not fal's raw temporary one."""
     job = _job()
     db = _webhook_db(job)
     released = []
     monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: released.append(uid))
+    monkeypatch.setattr(generation_svc, "download_from_url", MagicMock(return_value=b"bytes"))
+    monkeypatch.setattr(generation_svc, "upload_to_storage",
+                         MagicMock(return_value="https://our-storage.test/permanent/out.png"))
     refund = MagicMock()
     monkeypatch.setattr(generation_svc, "refund_credits", refund)
 
@@ -232,7 +238,7 @@ def test_webhook_success_completes_job_and_releases_lock(monkeypatch):
     )
 
     assert job.status == "completed"
-    assert job.output_url == "https://x.test/out.png"
+    assert job.output_url == "https://our-storage.test/permanent/out.png"
     assert released == [job.user_id]
     refund.assert_not_called()
     db.commit.assert_called_once()
@@ -308,16 +314,22 @@ def test_webhook_replay_on_terminal_job_is_a_safe_noop(monkeypatch, terminal_sta
     db.commit.assert_not_called()
 
 
-def test_webhook_no_images_in_success_payload_sets_null_output(monkeypatch):
+def test_webhook_no_images_in_success_payload_fails_and_refunds(monkeypatch):
+    """Updated for the storage-integration behavior change: fal reporting
+    success with no image is not a usable result, so it now fails + refunds
+    (see tests/test_storage_integration.py for the full matrix) instead of
+    completing with a null output_url."""
     job = _job()
     db = _webhook_db(job)
     monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
-    monkeypatch.setattr(generation_svc, "refund_credits", MagicMock())
+    refund = MagicMock()
+    monkeypatch.setattr(generation_svc, "refund_credits", refund)
 
     generation_svc.handle_fal_webhook(db, uuid.uuid4(), {"status": "OK", "payload": {"images": []}})
 
-    assert job.status == "completed"
+    assert job.status == "failed"
     assert job.output_url is None
+    refund.assert_called_once()
 
 
 # --------------------------------------------------------------------------- #
