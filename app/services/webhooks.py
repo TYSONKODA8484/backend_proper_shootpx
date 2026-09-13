@@ -324,6 +324,15 @@ def handle_subscription_charged(db: Session, event: dict) -> None:
 
     db.commit()
 
+def handle_subscription_completed(db: Session, event: dict):
+    sub_entity = event["payload"]["subscription"]["entity"]
+    team_sub = db.query(TeamSubscription).filter(
+        TeamSubscription.razorpay_subscription_id == sub_entity["id"]
+    ).with_for_update().first()
+
+    if team_sub and team_sub.status == "active":
+        team_sub.status = "cancelled"
+        db.commit()
 
 def handle_subscription_halted(db: Session, event: dict):
     sub_entity = event["payload"]["subscription"]["entity"]
@@ -358,12 +367,3 @@ def handle_subscription_pending(db: Session, event: dict) -> None:
         db.commit()
 
 
-def handle_subscription_completed(db: Session, event: dict):
-    sub_entity = event["payload"]["subscription"]["entity"]
-    team_sub = db.query(TeamSubscription).filter(
-        TeamSubscription.razorpay_subscription_id == sub_entity["id"]
-    ).with_for_update().first()
-
-    if team_sub and team_sub.status == "active":
-        team_sub.status = "cancelled"
-        db.commit()

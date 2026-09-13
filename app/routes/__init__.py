@@ -6,6 +6,7 @@ from app.routes import auth, billing, cache, health, tools
 from app.routes.teams import router as teams_router
 from app.routes.checkout import router as checkout_router
 from app.routes.webhooks import router as webhooks_router
+from app.routes.generation import router as generation_router
 
 api_router = APIRouter()
 api_router.include_router(health.router)
@@ -16,4 +17,4 @@ api_router.include_router(cache.router)
 api_router.include_router(teams_router)
 api_router.include_router(checkout_router)
 api_router.include_router(webhooks_router)
-
+api_router.include_router(generation_router)

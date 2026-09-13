@@ -44,5 +44,6 @@ async def razorpay_webhook(
         handle_subscription_pending(db, event)
     elif event_type == "subscription.completed":
         handle_subscription_completed(db, event)
+        
 
     return {"status": "ok"}

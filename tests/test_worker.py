@@ -38,7 +38,8 @@ def _refill_db(due=(), plan=None, lapse_due=(), team_for_update=None):
             else:
                 row_index = call_index - 2
                 row = due[row_index] if 0 <= row_index < len(due) else None
-                q.filter.return_value.with_for_update.return_value.first.return_value = row
+                (q.filter.return_value.populate_existing.return_value
+                   .with_for_update.return_value.first.return_value) = row
             q.join.return_value.filter.return_value.all.return_value = list(lapse_due)  # lapse pass
         elif name == "Subscription":
             q.filter.return_value.first.return_value = plan
@@ -104,6 +105,46 @@ def test_refill_one_failure_does_not_abort_the_batch(monkeypatch):
     db.rollback.assert_called()                 # the bad one was rolled back
     assert isinstance(good.next_refill_at, datetime)   # the good one still processed
     db.close.assert_called_once()               # session always closed
+
+
+def test_refill_locked_sub_re_query_uses_populate_existing(monkeypatch):
+    """Regression test for the identity-map staleness bug found live during
+    the sweep_stale_generation_jobs audit and confirmed to affect this same
+    function: `due` (the unlocked batch query) loads TeamSubscription rows
+    into this session's identity map, so the per-row locked re-query for the
+    same id must use populate_existing() -- otherwise it silently returns the
+    same stale cached object instead of the fresh, lock-guaranteed row, and a
+    subscription cancelled by a concurrent webhook moments earlier would
+    still read as 'active' and get refilled anyway."""
+    monkeypatch.setattr(worker, "refill_subscription_credits", lambda *a, **k: None)
+    ts = MagicMock(team_id="team-1", subscription_id="sub-1", status="active",
+                   credits_per_refill=1000, next_refill_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+    db = MagicMock()
+    call_count = {"n": 0}
+    populate_mock = MagicMock()
+    populate_mock.return_value.with_for_update.return_value.first.return_value = ts
+
+    def query(model):
+        q = MagicMock()
+        name = getattr(model, "__name__", "")
+        if name == "TeamSubscription":
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                q.filter.return_value.all.return_value = [ts]          # outer batch query
+                q.join.return_value.filter.return_value.all.return_value = []  # lapse pass
+            else:
+                q.filter.return_value.populate_existing = populate_mock  # per-row locked re-query
+        elif name == "Subscription":
+            q.filter.return_value.first.return_value = MagicMock(period_label="month")
+        return q
+
+    db.query.side_effect = query
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    _run(worker.refill_due_subscriptions({}))
+
+    populate_mock.assert_called_once()
+    assert ts.next_refill_at > datetime(2020, 1, 1, tzinfo=timezone.utc)
 
 
 def test_refill_skips_when_plan_missing(monkeypatch):
