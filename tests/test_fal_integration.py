@@ -285,27 +285,146 @@ def test_submit_re_enqueues_instead_of_submitting_when_at_capacity(monkeypatch):
 
     submit.assert_not_called()      # never sent to fal.ai while at capacity
     assert job.status == "queued"   # left alone for the deferred retry to pick up
+    enqueue.assert_called_once_with("submit_generation_to_fal", str(job.id), 2, _defer_by=5)  # attempt incremented
 
 
-def test_fal_slot_cap_real_redis_global_and_per_team(monkeypatch):
-    """Against the real Redis counters (same mechanism as the genlock tests
-    above): the global cap trips regardless of team, the per-team cap trips
-    independently and doesn't block a different team, and every reservation
-    this test takes is released again so it can't pollute other tests or the
-    real dev counters (see the -14 global-count corruption this class of test
-    isolation gap caused, found live and fixed in fail_and_release/sweep)."""
-    from app.core.config import settings
-    from app.core.cache import redis_client
-    from app.services.generation_lock import (
-        try_reserve_fal_slot, release_fal_slot, INFLIGHT_KEY_GLOBAL,
+def test_capacity_retry_gives_up_cleanly_after_the_hard_cap_instead_of_looping_forever(monkeypatch):
+    """Regression test: a real incident where a worker sent many repeated
+    requests while investigating this exact loop. pool.enqueue_job() starts a
+    brand-new arq job every time (its own try counter reset to 1), so arq's
+    own max_tries never bounds this -- without this explicit attempt cap, a
+    permanently-stuck fal concurrency counter would retry every 5s forever.
+    This proves the cap actually stops it: refunded, failed, lock released,
+    NOT re-enqueued again."""
+    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+                     feature_type="test_tool", credits_charged=5,
+                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+    db = _worker_db(job, _tool())
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)  # still at capacity
+    refund = MagicMock()
+    release = MagicMock()
+    monkeypatch.setattr(worker, "refund_credits", refund)
+    monkeypatch.setattr(worker, "release_generation_lock", release)
+
+    enqueue = MagicMock()
+    monkeypatch.setattr(worker, "get_arq_pool", MagicMock())  # must never even be reached
+
+    _run(worker.submit_generation_to_fal({}, str(job.id), attempt=worker.MAX_CAPACITY_RETRIES))
+
+    worker.get_arq_pool.assert_not_called()  # gave up instead of scheduling yet another retry
+    assert job.status == "failed"
+    assert job.error_message == worker.GENERIC_START_FAILED_MESSAGE
+    refund.assert_called_once_with(db, job.team_id, 5, 3, 2)
+    release.assert_called_once_with(job.user_id)
+
+
+def test_capacity_retry_stays_under_the_cap_keeps_retrying(monkeypatch):
+    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+                     feature_type="test_tool", credits_charged=5,
+                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+    db = _worker_db(job, _tool())
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)
+    refund = MagicMock()
+    monkeypatch.setattr(worker, "refund_credits", refund)
+
+    enqueue = MagicMock()
+    fake_pool = MagicMock()
+
+    async def fake_call(*a, **k):
+        return enqueue(*a, **k)
+    fake_pool.enqueue_job = fake_call
+
+    async def fake_get_arq_pool():
+        return fake_pool
+    monkeypatch.setattr(worker, "get_arq_pool", fake_get_arq_pool)
+
+    _run(worker.submit_generation_to_fal({}, str(job.id), attempt=worker.MAX_CAPACITY_RETRIES - 1))
+
+    enqueue.assert_called_once_with(
+        "submit_generation_to_fal", str(job.id), worker.MAX_CAPACITY_RETRIES, _defer_by=5,
     )
+    assert job.status == "queued"
+    refund.assert_not_called()
+
+
+def test_try_reserve_fal_slot_raising_fails_the_job_cleanly_not_stuck_forever(monkeypatch):
+    """The real gap found live: try_reserve_fal_slot() used to sit outside any
+    exception handler in submit_generation_to_fal. A transient Redis error
+    there would escape uncaught, leaving the job permanently 'queued' with
+    credits spent and the lock held -- nothing else would ever clean it up
+    (the fal slot itself was never reserved here, so release_fal_slot must
+    NOT be called)."""
+    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+                     feature_type="test_tool", credits_charged=5,
+                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+    db = _worker_db(job, _tool())
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    def boom(team_id):
+        raise ConnectionError("redis unreachable")
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", boom)
+
+    refund = MagicMock()
+    release = MagicMock()
+    release_slot = MagicMock()
+    monkeypatch.setattr(worker, "refund_credits", refund)
+    monkeypatch.setattr(worker, "release_generation_lock", release)
+    monkeypatch.setattr(worker, "release_fal_slot", release_slot)
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))  # must not raise
+
+    assert job.status == "failed"
+    assert job.error_message == worker.GENERIC_START_FAILED_MESSAGE
+    refund.assert_called_once_with(db, job.team_id, 5, 3, 2)
+    release.assert_called_once_with(job.user_id)
+    release_slot.assert_not_called()  # no slot was ever actually reserved
+
+
+def test_re_enqueue_failure_during_capacity_retry_fails_the_job_cleanly(monkeypatch):
+    """If even scheduling the deferred retry blows up (arq pool unreachable),
+    the job must still end up cleanly failed+refunded, not silently stuck."""
+    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+                     feature_type="test_tool", credits_charged=5,
+                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+    db = _worker_db(job, _tool())
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)
+
+    async def boom():
+        raise ConnectionError("arq pool unreachable")
+    monkeypatch.setattr(worker, "get_arq_pool", boom)
+
+    refund = MagicMock()
+    release = MagicMock()
+    monkeypatch.setattr(worker, "refund_credits", refund)
+    monkeypatch.setattr(worker, "release_generation_lock", release)
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))  # must not raise
+
+    assert job.status == "failed"
+    refund.assert_called_once_with(db, job.team_id, 5, 3, 2)
+    release.assert_called_once_with(job.user_id)
+
+
+def test_fal_slot_cap_real_redis_per_team_only(monkeypatch):
+    """Against the real Redis counters (same mechanism as the genlock tests
+    above): the per-team cap trips for that team and doesn't block a
+    different team, proving the fairness enforcement this cap exists for
+    still works. Every reservation this test takes is released again so it
+    can't pollute other tests or the real dev counters (see the -14
+    global-count corruption this class of test isolation gap caused, found
+    live and fixed in fail_and_release/sweep)."""
+    from app.core.config import settings
+    from app.services.generation_lock import try_reserve_fal_slot, release_fal_slot
 
     team_a = uuid.uuid4()
     team_b = uuid.uuid4()
     reserved = []
 
     try:
-        # Fill the per-team cap for team_a without tripping the global cap.
+        # Fill the per-team cap for team_a.
         for _ in range(settings.fal_per_team_concurrency_limit):
             ok = try_reserve_fal_slot(team_a)
             assert ok is True
@@ -320,26 +439,59 @@ def test_fal_slot_cap_real_redis_global_and_per_team(monkeypatch):
         for team_id in reserved:
             release_fal_slot(team_id)
 
-    # Global cap: the counter is a real, shared Redis value (not test-scoped),
-    # so measure its current baseline rather than assuming it starts at 0,
-    # then fill up to exactly the limit above that baseline.
+
+def test_fal_slot_reservation_no_longer_gates_on_the_global_account_wide_cap(monkeypatch):
+    """Real fix for the repeated-request incident: submitting past fal's own
+    account-wide concurrency limit must no longer be pre-checked/rejected on
+    our side -- fal's own documented behavior already queues and dispatches
+    automatically once that's hit. Proven here by reserving one slot each for
+    more distinct teams than the old global cap (fal_concurrency_limit)
+    allowed, each comfortably under its OWN per-team cap -- every single one
+    must still succeed."""
+    from app.core.config import settings
+    from app.services.generation_lock import try_reserve_fal_slot, release_fal_slot
+
+    num_teams = settings.fal_concurrency_limit + 5
     reserved = []
     try:
-        baseline = int(redis_client.get(INFLIGHT_KEY_GLOBAL) or 0)
-        slots_available = max(settings.fal_concurrency_limit - baseline, 0)
-        for _ in range(slots_available):
-            team = uuid.uuid4()
+        for _ in range(num_teams):
+            team = uuid.uuid4()  # a fresh team each time -- never approaches the per-team cap
             assert try_reserve_fal_slot(team) is True
             reserved.append(team)
-
-        extra_team = uuid.uuid4()
-        got_slot = try_reserve_fal_slot(extra_team)
-        if got_slot:
-            reserved.append(extra_team)  # unexpected, but clean it up either way
-        assert got_slot is False
     finally:
         for team_id in reserved:
             release_fal_slot(team_id)
+
+
+def test_try_reserve_fal_slot_rolls_back_global_increment_if_team_increment_fails(monkeypatch):
+    """Real leak found live: try_reserve_fal_slot() increments the global
+    counter, THEN the per-team counter. If the team-level incr() ever raises
+    (transient Redis error, or a corrupted non-integer value sitting at that
+    one key), the global increment was already committed to real Redis --
+    without an explicit rollback, it's stuck +1 forever with nothing left to
+    ever decrement it."""
+    from app.core.cache import redis_client
+    from app.services.generation_lock import try_reserve_fal_slot, INFLIGHT_KEY_GLOBAL
+
+    team = uuid.uuid4()
+    baseline_global = int(redis_client.get(INFLIGHT_KEY_GLOBAL) or 0)
+
+    real_incr = redis_client.incr
+
+    def flaky_incr(key, *a, **k):
+        if key == f"fal:inflight_count:{team}":
+            raise ConnectionError("redis blip mid-reservation")
+        return real_incr(key, *a, **k)
+
+    monkeypatch.setattr(redis_client, "incr", flaky_incr)
+
+    with pytest.raises(ConnectionError):
+        try_reserve_fal_slot(team)
+
+    monkeypatch.undo()  # restore the real incr before reading state back
+
+    assert int(redis_client.get(INFLIGHT_KEY_GLOBAL) or 0) == baseline_global  # rolled back, not leaked
+    assert int(redis_client.get(f"fal:inflight_count:{team}") or 0) == 0
 
 
 # --------------------------------------------------------------------------- #

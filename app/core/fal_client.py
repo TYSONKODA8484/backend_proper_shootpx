@@ -25,6 +25,53 @@ def submit_to_fal(model_id: str, input_params: dict, webhook_url: str) -> str:
         raise
     return response.json()["request_id"]
 
+def check_fal_status(model_id: str, request_id: str) -> dict:
+    """
+    Real status of an already-submitted request, via fal's queue status
+    endpoint -- "status" is one of IN_QUEUE / IN_PROGRESS / COMPLETED. Used
+    by the per-tool timeout check to confirm what fal itself actually knows
+    before giving up on a job locally purely because our own timeout budget
+    elapsed (our budget elapsing does not mean fal's did too).
+    """
+    response = httpx.get(
+        f"https://queue.fal.run/{model_id}/requests/{request_id}/status",
+        headers={"Authorization": f"Key {settings.fal_key}"},
+        timeout=15,
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        logger.exception("fal.ai status check failed [%s]: %s", response.status_code, response.text)
+        raise
+    return response.json()
+
+
+def fetch_fal_result(model_id: str, request_id: str) -> dict:
+    """
+    Fetches the real output for a request check_fal_status() reported
+    COMPLETED for. COMPLETED only means fal finished processing the request
+    -- it does not mean the generation itself succeeded, so this call's own
+    HTTP status is what actually distinguishes success from failure. Always
+    returns fal's own webhook shape ({"status": "OK", "payload": ...} or
+    {"status": "ERROR", "error": ...}) so callers can feed the result
+    straight into generation.handle_fal_webhook(), exactly like a real
+    webhook delivery would.
+    """
+    response = httpx.get(
+        f"https://queue.fal.run/{model_id}/requests/{request_id}",
+        headers={"Authorization": f"Key {settings.fal_key}"},
+        timeout=15,
+    )
+    if response.status_code >= 400:
+        logger.warning(
+            "fal.ai request %s COMPLETED but the result fetch itself failed [%s]: %s",
+            request_id, response.status_code, response.text,
+        )
+        return {"status": "ERROR", "error": f"fal.ai generation failed [{response.status_code}]"}
+
+    return {"status": "OK", "payload": response.json()}
+
+
 def call_fal_sync(model_id: str, input_params: dict) -> dict:
     """
     For fast, synchronous calls (like a short vision-model query) where we

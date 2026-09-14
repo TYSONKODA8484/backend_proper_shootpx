@@ -8,7 +8,7 @@ from arq.cron import cron
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.core.fal_client import submit_to_fal
+from app.core.fal_client import submit_to_fal, check_fal_status, fetch_fal_result
 from app.core.arq_pool import get_arq_pool
 from app.models.team_subscription import TeamSubscription
 from app.models.subscription import Subscription
@@ -17,6 +17,8 @@ from app.models.generation_job import GenerationJob
 from app.models.tool_definition import ToolDefinition
 from app.services.credits import refill_subscription_credits, refund_credits
 from app.services.generation_lock import release_generation_lock, try_reserve_fal_slot, release_fal_slot
+from app.services import generation as generation_svc
+from app.services.generation import TIMEOUT_MESSAGE, SWEEP_TIMEOUT_MESSAGE
 from app.tools.registry import TOOL_HANDLERS
 
 logger = logging.getLogger(__name__)
@@ -169,11 +171,24 @@ async def cleanup_stale_pending_subscriptions(ctx):
     db.close()
 
 
-async def submit_generation_to_fal(ctx, job_id: str):
+GENERIC_START_FAILED_MESSAGE = "Failed to start generation. Please try again."
+
+# At-capacity re-enqueues use pool.enqueue_job(), NOT arq's own Retry
+# mechanism -- each call starts a brand-new arq job with its own try counter
+# reset to 1, so arq's max_tries does not bound this loop at all. Without an
+# explicit cap here, a permanently-stuck concurrency counter (or any other
+# reason try_reserve_fal_slot keeps returning False -- now only the per-team
+# cap; see generation_lock.try_reserve_fal_slot) would retry every 5s
+# forever. 12 attempts * 5s defer =~ 1 minute before giving up cleanly.
+MAX_CAPACITY_RETRIES = 12
+
+
+async def submit_generation_to_fal(ctx, job_id: str, attempt: int = 1):
     """
     Picks up a queued GenerationJob and submits it to fal.ai for real.
     On success: status -> processing, waits for the real webhook.
-    On failure: status -> failed, credits refunded, lock + fal slot released.
+    On failure: status -> failed, credits refunded, lock (+ fal slot, if one
+    was actually reserved) released.
     """
     db = SessionLocal()
     try:
@@ -187,11 +202,50 @@ async def submit_generation_to_fal(ctx, job_id: str):
         if not tool:
             return
 
-        if not try_reserve_fal_slot(job.team_id):
-            # At capacity right now -- re-enqueue this same job to try again
-            # shortly, rather than sending a request fal would just queue anyway.
-            pool = await get_arq_pool()
-            await pool.enqueue_job("submit_generation_to_fal", job_id, _defer_by=5)
+        def fail_cleanly(message: str) -> None:
+            job.status = "failed"
+            job.error_message = message
+            refund_credits(
+                db, job.team_id, job.credits_charged,
+                job.credits_from_subscription, job.credits_from_topup,
+            )
+            db.commit()
+            release_generation_lock(job.user_id)
+
+        # Everything from here through the fal submission must have a clean
+        # failure path -- an uncaught exception anywhere in this function
+        # leaves the job stuck "queued" forever with credits spent and the
+        # lock held, since nothing else will ever mark it failed (the 10-min
+        # sweep eventually would, but there's no reason to make a user wait
+        # that long for what's already a definitive failure).
+        try:
+            slot_reserved = try_reserve_fal_slot(job.team_id)
+        except Exception:
+            logger.exception("try_reserve_fal_slot raised for job %s", job.id)
+            fail_cleanly(GENERIC_START_FAILED_MESSAGE)
+            return
+
+        if not slot_reserved:
+            if attempt >= MAX_CAPACITY_RETRIES:
+                logger.warning(
+                    "job %s gave up waiting for a fal concurrency slot after %d attempts",
+                    job.id, attempt,
+                )
+                fail_cleanly(GENERIC_START_FAILED_MESSAGE)
+                return
+
+            # At the per-team cap right now -- re-enqueue this same job to try
+            # again shortly, so one team's batch can't starve the others. (The
+            # account-wide fal limit is no longer pre-checked or retried on
+            # here -- fal's own documented behavior already queues and
+            # dispatches automatically once that's hit, so submission below
+            # just proceeds and lets fal handle it.)
+            try:
+                pool = await get_arq_pool()
+                await pool.enqueue_job("submit_generation_to_fal", job_id, attempt + 1, _defer_by=5)
+            except Exception:
+                logger.exception("failed to re-enqueue job %s for a later capacity retry", job.id)
+                fail_cleanly(GENERIC_START_FAILED_MESSAGE)
             return
 
         webhook_url = f"{settings.public_backend_url}/webhooks/fal?job_id={job.id}"
@@ -216,24 +270,148 @@ async def submit_generation_to_fal(ctx, job_id: str):
             # on success/failure, or below in sweep_stale_generation_jobs
             # on timeout). It is NOT released here on a successful submit.
         except Exception as e:
-            job.status = "failed"
-            job.error_message = f"fal submit failed: {str(e).replace(settings.fal_key, '[REDACTED]')}"
-            refund_credits(
-                db, job.team_id, job.credits_charged,
-                job.credits_from_subscription, job.credits_from_topup,
-            )
-            db.commit()
-            release_generation_lock(job.user_id)
+            fail_cleanly(f"fal submit failed: {str(e).replace(settings.fal_key, '[REDACTED]')}")
             release_fal_slot(job.team_id)
             logger.info("fal submit failed for job %s, refunded and released lock+slot", job.id)
     finally:
         db.close()
 
 
+def _fail_stale_job(db, job_id, message: str) -> bool:
+    """
+    Shared cleanup for a single stuck job, used by both the frequent
+    per-tool timeout check and the 10-minute catch-all sweep below. Re-locks
+    and re-reads the row under with_for_update() + populate_existing() (NOT
+    reusing the caller's unlocked copy) so a job a concurrent webhook already
+    resolved a moment ago is correctly left alone instead of being
+    double-refunded -- see test_sweep_populate_existing_prevents_stale_identity_map_read
+    for why populate_existing() specifically is required here.
+
+    Returns True if the job was actually failed, False if it was skipped
+    (already resolved, or gone).
+    """
+    locked_job = db.query(GenerationJob).filter(
+        GenerationJob.id == job_id
+    ).populate_existing().with_for_update().first()
+
+    if not locked_job or locked_job.status not in ("queued", "processing"):
+        return False
+
+    # A fal slot is only ever reserved once a job reaches "processing"
+    # (submit_generation_to_fal). A job still "queued" here (e.g. the worker
+    # never picked it up, or bailed early on an unknown tool) never held one
+    # -- releasing it anyway would decrement a counter nothing incremented,
+    # corrupting the concurrency cap.
+    had_fal_slot = locked_job.status == "processing"
+
+    locked_job.status = "failed"
+    locked_job.error_message = message
+    refund_credits(
+        db, locked_job.team_id, locked_job.credits_charged,
+        locked_job.credits_from_subscription, locked_job.credits_from_topup,
+    )
+    locked_job.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    release_generation_lock(locked_job.user_id)
+    if had_fal_slot:
+        release_fal_slot(locked_job.team_id)
+    return True
+
+
+async def check_generation_timeouts(ctx):
+    """
+    Per-tool timeout enforcement: runs far more often than the 10-minute
+    catch-all sweep below, and times each "processing" job out against its
+    own tool's generation_timeout_seconds instead of one fixed cutoff for
+    every tool. Only targets "processing" jobs -- a job still "queued" hasn't
+    been submitted to fal yet, so there's no tool-specific budget to measure
+    it against; the 10-minute sweep's flat cutoff still catches a job stuck
+    in that earlier state.
+
+    Before actually failing a job for running past its budget, this confirms
+    against fal's own real queue status first -- our local timeout elapsing
+    doesn't mean fal's work did too, and blindly failing+refunding a job fal
+    is about to (or already did) deliver for free is a real money-loss bug.
+    """
+    db = SessionLocal()
+    now = datetime.now(timezone.utc)
+
+    processing = db.query(GenerationJob).filter(
+        GenerationJob.status == "processing",
+    ).all()
+
+    tools_by_feature_type = {}
+
+    for job in processing:
+        try:
+            if job.feature_type not in tools_by_feature_type:
+                tools_by_feature_type[job.feature_type] = db.query(ToolDefinition).filter(
+                    ToolDefinition.feature_type == job.feature_type
+                ).first()
+
+            tool = tools_by_feature_type[job.feature_type]
+            if not tool:
+                continue  # unknown tool -- the 10-minute sweep will still catch it
+
+            if job.created_at > now - timedelta(seconds=tool.generation_timeout_seconds):
+                continue  # still within its own tool's budget
+
+            fal_status = None
+            if job.fal_request_id:
+                try:
+                    status_payload = check_fal_status(tool.fal_model_id, job.fal_request_id)
+                    fal_status = status_payload.get("status")
+                except Exception:
+                    logger.exception(
+                        "fal status check failed for job %s (fal_request_id=%s) -- "
+                        "falling back to the local timeout",
+                        job.id, job.fal_request_id,
+                    )
+
+            if fal_status == "COMPLETED":
+                # fal actually finished (successfully or not) before we got to
+                # it -- resolve with the real result via the exact same path a
+                # real webhook delivery would use, instead of failing a job
+                # that may well have already succeeded.
+                result_payload = fetch_fal_result(tool.fal_model_id, job.fal_request_id)
+                logger.info(
+                    "job %s locally timed out but fal had already COMPLETED it -- "
+                    "resolving with the real result instead of failing",
+                    job.id,
+                )
+                generation_svc.handle_fal_webhook(db, job.id, result_payload)
+                continue
+
+            if fal_status in ("IN_QUEUE", "IN_PROGRESS"):
+                # Measuring this specifically: how often our timeout fires
+                # while fal itself confirms the work is still genuinely
+                # ongoing (as opposed to us just never hearing back).
+                logger.warning(
+                    "job %s timed out while fal confirmed still in-progress "
+                    "(fal_status=%s) -- failing per the timeout as designed",
+                    job.id, fal_status,
+                )
+
+            if _fail_stale_job(db, job.id, TIMEOUT_MESSAGE):
+                logger.info(
+                    "Timed out job %s (feature_type=%s, budget=%ds)",
+                    job.id, job.feature_type, tool.generation_timeout_seconds,
+                )
+        except Exception:
+            db.rollback()
+            logger.exception("failed to check timeout for job %s — will retry next run", job.id)
+
+    db.close()
+
+
 async def sweep_stale_generation_jobs(ctx):
     """
     Catches jobs stuck in queued/processing for too long — a crashed worker,
     a lost webhook, or fal.ai never responding. Marks them failed and refunds.
+    A catch-all safety net behind check_generation_timeouts above: it uses one
+    fixed 10-minute cutoff (vs. each tool's own, much shorter budget), so it
+    also still catches jobs stuck "queued" (never even submitted) which the
+    per-tool check above doesn't look at.
     """
     db = SessionLocal()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
@@ -245,32 +423,8 @@ async def sweep_stale_generation_jobs(ctx):
 
     for job in stale:
         try:
-            locked_job = db.query(GenerationJob).filter(
-                GenerationJob.id == job.id
-            ).populate_existing().with_for_update().first()
-
-            if not locked_job or locked_job.status not in ("queued", "processing"):
-                continue
-
-            # A fal slot is only ever reserved once a job reaches "processing"
-            # (submit_generation_to_fal). A job still "queued" here (e.g. the
-            # worker never picked it up, or bailed early on an unknown tool)
-            # never held one -- releasing it anyway would decrement a counter
-            # nothing incremented, corrupting the concurrency cap.
-            had_fal_slot = locked_job.status == "processing"
-
-            locked_job.status = "failed"
-            locked_job.error_message = "Generation timed out — no response received"
-            refund_credits(
-                db, locked_job.team_id, locked_job.credits_charged,
-                locked_job.credits_from_subscription, locked_job.credits_from_topup,
-            )
-            locked_job.completed_at = datetime.now(timezone.utc)
-            db.commit()
-            release_generation_lock(locked_job.user_id)
-            if had_fal_slot:
-                release_fal_slot(locked_job.team_id)
-            logger.info("Swept stale job %s (was stuck since %s)", locked_job.id, locked_job.created_at)
+            if _fail_stale_job(db, job.id, SWEEP_TIMEOUT_MESSAGE):
+                logger.info("Swept stale job %s (was stuck since %s)", job.id, job.created_at)
         except Exception:
             db.rollback()
             logger.exception("failed to sweep job %s — will retry next run", job.id)
@@ -292,11 +446,13 @@ class WorkerSettings:
         cleanup_stale_pending_subscriptions,
         submit_generation_to_fal,
         sweep_stale_generation_jobs,
+        check_generation_timeouts,
     ]
     cron_jobs = [
         cron(refill_due_subscriptions, hour=3, minute=0),
         cron(cleanup_stale_pending_subscriptions, hour=4, minute=0),
         cron(sweep_stale_generation_jobs, minute={0, 15, 30, 45}),
+        cron(check_generation_timeouts, second={0, 15, 30, 45}),
     ]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
 

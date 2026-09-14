@@ -16,3 +16,4 @@ class ToolDefinition(Base):
     is_active = Column(Boolean, nullable=False, default=True)
     ai_steps = Column(JSONB, nullable=False, default=dict)
     stage = Column(Integer, nullable=False, default=1)
+    generation_timeout_seconds = Column(Integer, nullable=False, default=60)

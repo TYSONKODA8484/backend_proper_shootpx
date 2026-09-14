@@ -351,7 +351,7 @@ def _webhook_db(job, remaining_in_batch=0):
     handle_fal_webhook's `remaining <= 1` check), anything higher means
     siblings are still in flight and the lock must stay held."""
     db = MagicMock()
-    (db.query.return_value.filter.return_value
+    (db.query.return_value.filter.return_value.populate_existing.return_value
        .with_for_update.return_value.first.return_value) = job
     db.query.return_value.filter.return_value.count.return_value = remaining_in_batch
     return db
@@ -412,7 +412,7 @@ def test_webhook_failure_defaults_error_message_when_absent(monkeypatch):
 
 def test_webhook_unknown_job_id_is_a_safe_noop(monkeypatch):
     db = MagicMock()
-    (db.query.return_value.filter.return_value
+    (db.query.return_value.filter.return_value.populate_existing.return_value
        .with_for_update.return_value.first.return_value) = None
     refund = MagicMock()
     release = MagicMock()
