@@ -21,6 +21,10 @@ from app.services.generation_lock import (
 
 TEAM_ID = uuid.uuid4()
 
+# release_fal_slot / try_reserve_fal_slot are auto-mocked for every test by
+# the autouse fixture in conftest.py (they talk to real Redis, and almost
+# nothing here is testing the fal-concurrency-limit feature itself).
+
 
 # --------------------------------------------------------------------------- #
 # Lock behavior — against the real Redis instance, same pattern as
@@ -256,6 +260,70 @@ def test_create_batch_uses_tool_default_output_count_when_not_specified(monkeypa
 
     assert len(jobs) == 3
     spend.assert_called_once_with(db, TEAM_ID, 15, commit=False)  # 5 * 3, not 5 * 0
+
+
+# --------------------------------------------------------------------------- #
+# _resolve_credit_cost — per-tier pricing (Standard/Advanced/Premium selects)
+# --------------------------------------------------------------------------- #
+
+QUALITY_TIER_SCHEMA = [
+    {
+        "name": "quality",
+        "type": "select",
+        "label": "Quality",
+        "options": [
+            {"value": "standard", "credit_cost": 5},
+            {"value": "advanced", "credit_cost": 10},
+            {"value": "premium", "credit_cost": 20},
+        ],
+    },
+]
+
+
+@pytest.mark.parametrize("quality,expected_cost", [
+    ("standard", 5),
+    ("advanced", 10),
+    ("premium", 20),
+])
+def test_resolve_credit_cost_picks_the_selected_tier(quality, expected_cost):
+    cost = generation_svc._resolve_credit_cost(QUALITY_TIER_SCHEMA, {"quality": quality}, fallback_cost=1)
+    assert cost == expected_cost
+
+
+def test_resolve_credit_cost_falls_back_when_selected_value_matches_no_tier():
+    cost = generation_svc._resolve_credit_cost(QUALITY_TIER_SCHEMA, {"quality": "unknown-tier"}, fallback_cost=7)
+    assert cost == 7
+
+
+def test_resolve_credit_cost_ignores_plain_string_options_without_credit_cost():
+    """A select field whose options are plain strings (e.g. size/aspect ratio)
+    must never be mistaken for a priced tier -- only options shaped as dicts
+    with a credit_cost key opt into per-tier pricing."""
+    schema = [{"name": "size", "type": "select", "options": ["1:1", "16:9"]}]
+    cost = generation_svc._resolve_credit_cost(schema, {"size": "16:9"}, fallback_cost=3)
+    assert cost == 3
+
+
+def test_create_batch_charges_the_selected_tiers_credit_cost_not_the_flat_default(monkeypatch):
+    """End-to-end through create_generation_batch: the tool's flat
+    credit_cost_per_output must be overridden by the selected quality tier's
+    own credit_cost, and that per-tier cost is what's split across every job
+    in a multi-output batch."""
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: True)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    spend = MagicMock(return_value=(MagicMock(), 40, 0))
+    monkeypatch.setattr(generation_svc, "spend_credits", spend)
+    tool = _tool(credit_cost=5)
+    tool.param_schema = QUALITY_TIER_SCHEMA
+    db = _job_db(tool)
+
+    jobs = generation_svc.create_generation_batch(
+        db, TEAM_ID, uuid.uuid4(), "test_tool", {"quality": "premium"}, output_count=2,
+    )
+
+    assert len(jobs) == 2
+    spend.assert_called_once_with(db, TEAM_ID, 40, commit=False)  # 20 (premium) * 2, not 5 (flat) * 2
+    assert all(j.credits_charged == 20 for j in jobs)
 
 
 # --------------------------------------------------------------------------- #
@@ -498,7 +566,8 @@ def test_generate_rejects_non_team_member(gen_client, monkeypatch):
 
     res = client.post(
         "/generate",
-        json={"team_id": str(TEAM_ID), "feature_type": "test_tool", "input_params": {}},
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
         headers={"Authorization": "Bearer x"},
     )
 
@@ -508,6 +577,11 @@ def test_generate_rejects_non_team_member(gen_client, monkeypatch):
 def test_generate_allows_team_member_and_surfaces_value_error_as_400(gen_client, monkeypatch):
     client, fake_user, db = gen_client
     monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=5)
+    monkeypatch.setattr(
+        "app.routes.generation.upload_image_to_fal",
+        lambda *a, **k: "https://fal.test/uploaded.png",
+    )
     monkeypatch.setattr(
         "app.routes.generation.create_generation_batch",
         MagicMock(side_effect=ValueError("You already have a generation in progress. Please wait for it to finish.")),
@@ -515,12 +589,98 @@ def test_generate_allows_team_member_and_surfaces_value_error_as_400(gen_client,
 
     res = client.post(
         "/generate",
-        json={"team_id": str(TEAM_ID), "feature_type": "test_tool", "input_params": {}},
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
         headers={"Authorization": "Bearer x"},
     )
 
     assert res.status_code == 400
     assert "already have a generation in progress" in res.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# /generate: multi-image upload + max_input_images enforcement
+# --------------------------------------------------------------------------- #
+
+def test_generate_rejects_unknown_tool_before_any_upload_or_charge(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = None  # tool lookup finds nothing
+    upload = MagicMock()
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "ghost_tool"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 400
+    assert res.json()["detail"] == "Unknown tool"
+    upload.assert_not_called()  # rejected before ever touching fal's CDN
+
+
+def test_generate_rejects_more_images_than_the_tools_max_input_images(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=1)
+    upload = MagicMock()
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool"},
+        files=[
+            ("images", ("one.png", b"one", "image/png")),
+            ("images", ("two.png", b"two", "image/png")),
+        ],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 400
+    assert "at most 1" in res.json()["detail"]
+    upload.assert_not_called()  # rejected before uploading anything to fal's CDN
+
+
+def test_generate_uploads_every_image_and_passes_all_urls_through(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=3)
+
+    upload = MagicMock(side_effect=["https://fal.test/1.png", "https://fal.test/2.png"])
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+
+    captured = {}
+
+    def fake_create_batch(db_, team_id, user_id, feature_type, input_params, output_count):
+        captured["input_params"] = input_params
+        return [MagicMock(id=uuid.uuid4(), batch_id=uuid.uuid4(), status="queued")]
+    monkeypatch.setattr("app.routes.generation.create_generation_batch", fake_create_batch)
+
+    async def fake_get_arq_pool():
+        pool = MagicMock()
+
+        async def enqueue_job(*a, **k):
+            return None
+        pool.enqueue_job = enqueue_job
+        return pool
+    monkeypatch.setattr("app.routes.generation.get_arq_pool", fake_get_arq_pool)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool"},
+        files=[
+            ("images", ("one.png", b"one", "image/png")),
+            ("images", ("two.png", b"two", "image/png")),
+        ],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 200
+    assert upload.call_count == 2
+    # image_urls is ALWAYS a list, in upload order, one URL per uploaded file
+    assert captured["input_params"]["image_urls"] == ["https://fal.test/1.png", "https://fal.test/2.png"]
 
 
 def test_get_job_rejects_non_team_member(gen_client, monkeypatch):

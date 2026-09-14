@@ -66,13 +66,15 @@ def _job(status="processing", minutes_old=20, credits_charged=5, from_sub=3, fro
 # --------------------------------------------------------------------------- #
 
 def test_sweep_marks_stale_job_failed_refunds_and_releases_lock(monkeypatch):
-    job = _job()
+    job = _job()  # default status="processing" -- did hold a fal slot
     db = _sweep_db([job])
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     refund = MagicMock()
     release = MagicMock()
+    release_slot = MagicMock()
     monkeypatch.setattr(worker, "refund_credits", refund)
     monkeypatch.setattr(worker, "release_generation_lock", release)
+    monkeypatch.setattr(worker, "release_fal_slot", release_slot)
 
     _run(worker.sweep_stale_generation_jobs({}))
 
@@ -80,7 +82,30 @@ def test_sweep_marks_stale_job_failed_refunds_and_releases_lock(monkeypatch):
     assert "timed out" in job.error_message.lower()
     refund.assert_called_once_with(db, job.team_id, 5, 3, 2)  # exact stored split
     release.assert_called_once_with(job.user_id)
+    release_slot.assert_called_once_with(job.team_id)  # was "processing" -- had a real slot to free
     db.commit.assert_called_once()
+
+
+def test_sweep_does_not_release_a_fal_slot_for_a_job_that_never_reserved_one(monkeypatch):
+    """Regression test: a job swept while still 'queued' (worker never picked
+    it up, or bailed early e.g. on an unknown tool) never reserved a fal slot
+    -- try_reserve_fal_slot only runs once a job is dispatched into
+    submit_generation_to_fal. Calling release_fal_slot for it anyway would
+    decrement a counter nothing incremented, corrupting the concurrency cap
+    (reproduced live: the real dev Redis inflight counter was found at -14
+    from exactly this kind of unmatched release)."""
+    job = _job(status="queued")
+    db = _sweep_db([job])
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "refund_credits", MagicMock())
+    monkeypatch.setattr(worker, "release_generation_lock", MagicMock())
+    release_slot = MagicMock()
+    monkeypatch.setattr(worker, "release_fal_slot", release_slot)
+
+    _run(worker.sweep_stale_generation_jobs({}))
+
+    assert job.status == "failed"
+    release_slot.assert_not_called()
 
 
 def test_sweep_skips_job_already_resolved_by_the_time_it_is_locked(monkeypatch):
@@ -127,6 +152,7 @@ def test_sweep_one_job_failure_does_not_abort_the_batch(monkeypatch):
             raise RuntimeError("db blip")
     monkeypatch.setattr(worker, "refund_credits", refund)
     monkeypatch.setattr(worker, "release_generation_lock", MagicMock())
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
 
     _run(worker.sweep_stale_generation_jobs({}))
 
@@ -247,6 +273,7 @@ def test_sweep_re_lock_query_actually_calls_populate_existing(monkeypatch):
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(worker, "refund_credits", MagicMock())
     monkeypatch.setattr(worker, "release_generation_lock", MagicMock())
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
 
     _run(worker.sweep_stale_generation_jobs({}))
 

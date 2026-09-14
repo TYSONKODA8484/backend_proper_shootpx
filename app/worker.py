@@ -9,23 +9,20 @@ from arq.cron import cron
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.fal_client import submit_to_fal
+from app.core.arq_pool import get_arq_pool
 from app.models.team_subscription import TeamSubscription
 from app.models.subscription import Subscription
 from app.models.team import Team
 from app.models.generation_job import GenerationJob
 from app.models.tool_definition import ToolDefinition
 from app.services.credits import refill_subscription_credits, refund_credits
-from app.services.generation_lock import release_generation_lock
+from app.services.generation_lock import release_generation_lock, try_reserve_fal_slot, release_fal_slot
+from app.tools.registry import TOOL_HANDLERS
 
 logger = logging.getLogger(__name__)
 
 
 async def refill_due_subscriptions(ctx):
-    """
-    Runs daily. Two passes:
-    1. Refill active subscriptions whose next_refill_at has passed.
-    2. Lapse (zero out) cancelled subscriptions past their reset point.
-    """
     db = SessionLocal()
     now = datetime.now(timezone.utc)
 
@@ -36,15 +33,6 @@ async def refill_due_subscriptions(ctx):
 
     for team_sub in due:
         try:
-            # populate_existing() is required: team_sub (same id) is already
-            # in this session's identity map from the unlocked `due` query
-            # above. Without it, SQLAlchemy returns the SAME cached object
-            # with its stale pre-lock status/next_refill_at instead of the
-            # fresh row FOR UPDATE just fetched, so this re-check would
-            # silently pass on data from before the lock -- a subscription
-            # cancelled by a concurrent webhook moments earlier would still
-            # read as 'active' here and get refilled anyway. Same root cause
-            # found and fixed in sweep_stale_generation_jobs during today's audit.
             locked_sub = db.query(TeamSubscription).filter(
                 TeamSubscription.id == team_sub.id
             ).populate_existing().with_for_update().first()
@@ -103,10 +91,6 @@ async def refill_due_subscriptions(ctx):
 
 
 async def cleanup_stale_pending_subscriptions(ctx):
-    """
-    A pending row with no activation ever received blocks that team from
-    subscribing again. Anything pending for more than 30 minutes is stale.
-    """
     db = SessionLocal()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
 
@@ -127,7 +111,7 @@ async def submit_generation_to_fal(ctx, job_id: str):
     """
     Picks up a queued GenerationJob and submits it to fal.ai for real.
     On success: status -> processing, waits for the real webhook.
-    On failure: status -> failed, credits refunded, lock released.
+    On failure: status -> failed, credits refunded, lock + fal slot released.
     """
     db = SessionLocal()
     try:
@@ -141,19 +125,34 @@ async def submit_generation_to_fal(ctx, job_id: str):
         if not tool:
             return
 
+        if not try_reserve_fal_slot(job.team_id):
+            # At capacity right now -- re-enqueue this same job to try again
+            # shortly, rather than sending a request fal would just queue anyway.
+            pool = await get_arq_pool()
+            await pool.enqueue_job("submit_generation_to_fal", job_id, _defer_by=5)
+            return
+
         webhook_url = f"{settings.public_backend_url}/webhooks/fal?job_id={job.id}"
 
         try:
-            fal_request_id = submit_to_fal(tool.fal_model_id, job.input_params, webhook_url)
+            build_instruction = TOOL_HANDLERS.get(job.feature_type)
+            if build_instruction:
+                instruction = build_instruction(job, tool)
+                params = {**job.input_params, "prompt": instruction}
+            else:
+                params = job.input_params
+
+            fal_request_id = submit_to_fal(tool.fal_model_id, params, webhook_url)
             job.fal_request_id = fal_request_id
             job.status = "processing"
             db.commit()
             logger.info("Submitted job %s to fal.ai (request_id=%s)", job.id, fal_request_id)
+            # NOTE: the fal slot stays reserved -- it is only released once
+            # this job reaches a real terminal state (in handle_fal_webhook
+            # on success/failure, or below in sweep_stale_generation_jobs
+            # on timeout). It is NOT released here on a successful submit.
         except Exception as e:
             job.status = "failed"
-            # Defense in depth: job.error_message is returned to any team
-            # member via GET /jobs/{id}, so FAL_KEY must never reach it even
-            # if some future exception type ever echoed request headers.
             job.error_message = f"fal submit failed: {str(e).replace(settings.fal_key, '[REDACTED]')}"
             refund_credits(
                 db, job.team_id, job.credits_charged,
@@ -161,7 +160,8 @@ async def submit_generation_to_fal(ctx, job_id: str):
             )
             db.commit()
             release_generation_lock(job.user_id)
-            logger.info("fal submit failed for job %s, refunded and released lock", job.id)
+            release_fal_slot(job.team_id)
+            logger.info("fal submit failed for job %s, refunded and released lock+slot", job.id)
     finally:
         db.close()
 
@@ -181,23 +181,19 @@ async def sweep_stale_generation_jobs(ctx):
 
     for job in stale:
         try:
-            # populate_existing() is required here: `job` (and therefore this
-            # same id) is already in this session's identity map from the
-            # unlocked query above. Without it, SQLAlchemy returns the SAME
-            # cached Python object with its stale pre-lock attributes instead
-            # of refreshing them from the row FOR UPDATE just fetched, so the
-            # status re-check below would silently pass on data from before
-            # the lock was ever acquired -- a real webhook completing this
-            # exact job while the sweep is mid-flight would go undetected and
-            # get double-refunded. Confirmed live: without this, a job a
-            # webhook had already marked 'completed' still read as
-            # 'processing' here, moments after the webhook committed.
             locked_job = db.query(GenerationJob).filter(
                 GenerationJob.id == job.id
             ).populate_existing().with_for_update().first()
 
             if not locked_job or locked_job.status not in ("queued", "processing"):
-                continue  # already resolved by the time we got the lock
+                continue
+
+            # A fal slot is only ever reserved once a job reaches "processing"
+            # (submit_generation_to_fal). A job still "queued" here (e.g. the
+            # worker never picked it up, or bailed early on an unknown tool)
+            # never held one -- releasing it anyway would decrement a counter
+            # nothing incremented, corrupting the concurrency cap.
+            had_fal_slot = locked_job.status == "processing"
 
             locked_job.status = "failed"
             locked_job.error_message = "Generation timed out — no response received"
@@ -208,6 +204,8 @@ async def sweep_stale_generation_jobs(ctx):
             locked_job.completed_at = datetime.now(timezone.utc)
             db.commit()
             release_generation_lock(locked_job.user_id)
+            if had_fal_slot:
+                release_fal_slot(locked_job.team_id)
             logger.info("Swept stale job %s (was stuck since %s)", locked_job.id, locked_job.created_at)
         except Exception:
             db.rollback()

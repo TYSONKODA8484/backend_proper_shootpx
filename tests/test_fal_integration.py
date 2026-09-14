@@ -54,6 +54,11 @@ def test_generate_cleans_up_when_arq_enqueue_fails(gen_client, monkeypatch):
     the per-user lock held, with nothing ever going to process it."""
     client, fake_user, db = gen_client
     monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=5)
+    monkeypatch.setattr(
+        "app.routes.generation.upload_image_to_fal",
+        lambda *a, **k: "https://fal.test/uploaded.png",
+    )
 
     job = MagicMock(id=uuid.uuid4(), status="queued", team_id=TEAM_ID, user_id=fake_user.id,
                      credits_charged=5, credits_from_subscription=3, credits_from_topup=2)
@@ -74,7 +79,8 @@ def test_generate_cleans_up_when_arq_enqueue_fails(gen_client, monkeypatch):
 
     res = client.post(
         "/generate",
-        json={"team_id": str(TEAM_ID), "feature_type": "test_tool", "input_params": {}},
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
         headers={"Authorization": "Bearer x"},
     )
 
@@ -128,6 +134,8 @@ def test_duplicate_run_after_success_does_not_resubmit(monkeypatch):
     monkeypatch.setattr(worker, "submit_to_fal", submit)
     refund = MagicMock()
     monkeypatch.setattr(worker, "refund_credits", refund)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
 
     _run(worker.submit_generation_to_fal({}, str(job.id)))
     assert job.status == "processing"
@@ -152,19 +160,24 @@ def test_duplicate_run_after_failure_does_not_double_refund(monkeypatch):
     monkeypatch.setattr(worker, "submit_to_fal", MagicMock(side_effect=RuntimeError("fal 500")))
     refund = MagicMock()
     release = MagicMock()
+    release_slot = MagicMock()
     monkeypatch.setattr(worker, "refund_credits", refund)
     monkeypatch.setattr(worker, "release_generation_lock", release)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", release_slot)
 
     _run(worker.submit_generation_to_fal({}, str(job.id)))
     assert job.status == "failed"
     refund.assert_called_once_with(db, job.team_id, 5, 3, 2)
     release.assert_called_once_with(job.user_id)
+    release_slot.assert_called_once_with(job.team_id)  # reserved right before the failed submit -- must free it
 
     # arq retries the same (now-failed) job
     _run(worker.submit_generation_to_fal({}, str(job.id)))
 
-    refund.assert_called_once()   # still just the one call -- NOT double-refunded
-    release.assert_called_once()  # NOT released a second time either
+    refund.assert_called_once()        # still just the one call -- NOT double-refunded
+    release.assert_called_once()       # NOT released a second time either
+    release_slot.assert_called_once()  # NOT released a second time either
 
 
 def test_lock_is_not_released_on_successful_fal_submit(monkeypatch):
@@ -178,13 +191,19 @@ def test_lock_is_not_released_on_successful_fal_submit(monkeypatch):
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(worker, "submit_to_fal", MagicMock(return_value="fal-req-1"))
     release = MagicMock()
+    release_slot = MagicMock()
     monkeypatch.setattr(worker, "release_generation_lock", release)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", release_slot)
 
     _run(worker.submit_generation_to_fal({}, str(job.id)))
 
     assert job.status == "processing"
     assert job.fal_request_id == "fal-req-1"
     release.assert_not_called()
+    # the fal slot stays reserved too -- only the webhook (or a sweep timeout)
+    # frees it, once the job actually reaches a terminal state
+    release_slot.assert_not_called()
 
 
 def test_unknown_tool_is_a_safe_noop_not_a_crash(monkeypatch):
@@ -200,6 +219,97 @@ def test_unknown_tool_is_a_safe_noop_not_a_crash(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# fal concurrency limiting: at-capacity re-enqueue, and the real per-team +
+# global caps against actual Redis.
+# --------------------------------------------------------------------------- #
+
+def test_submit_re_enqueues_instead_of_submitting_when_at_capacity(monkeypatch):
+    """try_reserve_fal_slot() returning False means fal is at capacity right
+    now -- the job must be deferred back onto the queue, NOT sent to fal.ai,
+    and it must stay 'queued' (not touched) so a later attempt can pick it up
+    cleanly."""
+    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+                     feature_type="test_tool", credits_charged=5,
+                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+    db = _worker_db(job, _tool())
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)
+    submit = MagicMock()
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+
+    enqueue = MagicMock()
+    fake_pool = MagicMock()
+
+    async def fake_call(*a, **k):
+        return enqueue(*a, **k)
+    fake_pool.enqueue_job = fake_call
+
+    async def fake_get_arq_pool():
+        return fake_pool
+    monkeypatch.setattr(worker, "get_arq_pool", fake_get_arq_pool)
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    submit.assert_not_called()      # never sent to fal.ai while at capacity
+    assert job.status == "queued"   # left alone for the deferred retry to pick up
+
+
+def test_fal_slot_cap_real_redis_global_and_per_team(monkeypatch):
+    """Against the real Redis counters (same mechanism as the genlock tests
+    above): the global cap trips regardless of team, the per-team cap trips
+    independently and doesn't block a different team, and every reservation
+    this test takes is released again so it can't pollute other tests or the
+    real dev counters (see the -14 global-count corruption this class of test
+    isolation gap caused, found live and fixed in fail_and_release/sweep)."""
+    from app.core.config import settings
+    from app.core.cache import redis_client
+    from app.services.generation_lock import (
+        try_reserve_fal_slot, release_fal_slot, INFLIGHT_KEY_GLOBAL,
+    )
+
+    team_a = uuid.uuid4()
+    team_b = uuid.uuid4()
+    reserved = []
+
+    try:
+        # Fill the per-team cap for team_a without tripping the global cap.
+        for _ in range(settings.fal_per_team_concurrency_limit):
+            ok = try_reserve_fal_slot(team_a)
+            assert ok is True
+            reserved.append(team_a)
+
+        # team_a is now at ITS cap -- must be rejected...
+        assert try_reserve_fal_slot(team_a) is False
+        # ...but team_b is unaffected, proving the per-team cap doesn't starve others.
+        assert try_reserve_fal_slot(team_b) is True
+        reserved.append(team_b)
+    finally:
+        for team_id in reserved:
+            release_fal_slot(team_id)
+
+    # Global cap: the counter is a real, shared Redis value (not test-scoped),
+    # so measure its current baseline rather than assuming it starts at 0,
+    # then fill up to exactly the limit above that baseline.
+    reserved = []
+    try:
+        baseline = int(redis_client.get(INFLIGHT_KEY_GLOBAL) or 0)
+        slots_available = max(settings.fal_concurrency_limit - baseline, 0)
+        for _ in range(slots_available):
+            team = uuid.uuid4()
+            assert try_reserve_fal_slot(team) is True
+            reserved.append(team)
+
+        extra_team = uuid.uuid4()
+        got_slot = try_reserve_fal_slot(extra_team)
+        if got_slot:
+            reserved.append(extra_team)  # unexpected, but clean it up either way
+        assert got_slot is False
+    finally:
+        for team_id in reserved:
+            release_fal_slot(team_id)
+
+
+# --------------------------------------------------------------------------- #
 # FAL_KEY must never leak into a stored/returned error message.
 # --------------------------------------------------------------------------- #
 
@@ -211,6 +321,8 @@ def test_fal_key_never_appears_in_worker_error_message(monkeypatch):
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(worker, "refund_credits", MagicMock())
     monkeypatch.setattr(worker, "release_generation_lock", MagicMock())
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
 
     # Simulate the worst case: an exception whose message happens to include
     # the raw Authorization header value, exactly as a raw httpx request-prep

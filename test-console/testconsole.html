@@ -92,6 +92,39 @@
 <input id="cache-secret" placeholder="cache clear secret" size="44" />
 <button id="clear-cache-btn">POST /admin/cache/clear</button>
 
+<h2>7. Generation (multipart /generate)</h2>
+<div>
+  <input id="gen-team-id" placeholder="team_id" size="38" />
+  <input id="gen-feature-type" placeholder="feature_type (e.g. recolor)" size="20" value="recolor" />
+  <button id="load-schema-btn">GET /tools/{feature_type}/schema</button>
+</div>
+<div id="gen-schema-info" style="color:#777;font-size:13px;margin-top:4px;">
+  Load a tool's schema to build the form below -- fields are never hardcoded here.
+</div>
+
+<div id="gen-fields" style="margin-top:10px;"></div>
+
+<div style="margin-top:10px;">
+  <label>Image(s): <input id="gen-images" type="file" accept="image/*" /></label>
+  <span id="gen-images-hint" style="color:#777;font-size:12px;"></span>
+</div>
+<div style="margin-top:8px;">
+  <label>output_count: <input id="gen-output-count" type="number" min="1" value="1" size="4" /></label>
+  <button id="gen-submit-btn">POST /generate</button>
+</div>
+
+<div id="gen-result" style="margin-top:12px;"></div>
+
+<div style="margin-top:10px;">
+  <input id="lookup-job-id" placeholder="jobId" size="38" />
+  <button id="lookup-job-btn">GET /jobs/{id}</button>
+</div>
+
+<div style="color:#777;font-size:12px;margin-top:10px;">
+  Webhook endpoint (for sending a manual signed test webhook):
+  <code id="gen-webhook-url">POST {backend}/webhooks/fal?job_id={jobId}</code>
+</div>
+
 <h2>Log</h2>
 <button id="clear-log-btn">clear log</button>
 <pre id="log">(responses appear here)</pre>
@@ -334,6 +367,180 @@
     call("POST", "/admin/cache/clear", { headers: { "x-cache-secret": $("cache-secret").value } });
 
   $("clear-log-btn").onclick = () => { logEl.textContent = ""; };
+
+  // --- Generation: schema-driven /generate form -------------------------
+  // Drives a real POST /generate as genuine multipart/form-data (a real file
+  // input, not JSON). Fields come entirely from GET /tools/{feature_type}/schema
+  // -- nothing about Recolor (or any other tool) is hardcoded here, so this
+  // stays useful as new tools are added.
+  let currentSchema = null; // { featureType, maxInputImages, paramSchema }
+  let pollTimer = null;
+
+  function optionValue(opt) { return typeof opt === "object" ? opt.value : opt; }
+  function optionLabel(opt) {
+    if (typeof opt !== "object") return String(opt);
+    return opt.credit_cost != null ? `${opt.value} (${opt.credit_cost} credits)` : String(opt.value);
+  }
+
+  function renderSchemaFields(schema) {
+    const container = $("gen-fields");
+    container.innerHTML = "";
+
+    for (const field of schema.paramSchema || []) {
+      const row = document.createElement("div");
+      row.style.margin = "6px 0";
+
+      const label = document.createElement("label");
+      label.textContent = `${field.label || field.name}${field.required ? " *" : ""}: `;
+      label.htmlFor = `gen-field-${field.name}`;
+      row.appendChild(label);
+
+      if (field.type === "select") {
+        const select = document.createElement("select");
+        select.id = `gen-field-${field.name}`;
+        if (!field.required) {
+          const blank = document.createElement("option");
+          blank.value = "";
+          blank.textContent = "(none)";
+          select.appendChild(blank);
+        }
+        for (const opt of field.options || []) {
+          const optionEl = document.createElement("option");
+          optionEl.value = optionValue(opt);
+          optionEl.textContent = optionLabel(opt);
+          select.appendChild(optionEl);
+        }
+        row.appendChild(select);
+      } else {
+        const input = document.createElement("input");
+        input.type = "text";
+        input.id = `gen-field-${field.name}`;
+        input.size = 30;
+        row.appendChild(input);
+
+        // Convenience only, not hardcoding: any text field whose name looks
+        // like a color gets a paired native color-picker that fills it in.
+        if (field.name.toLowerCase().includes("color")) {
+          const picker = document.createElement("input");
+          picker.type = "color";
+          picker.style.marginLeft = "6px";
+          picker.oninput = () => { input.value = picker.value; };
+          row.appendChild(picker);
+        }
+      }
+
+      container.appendChild(row);
+    }
+
+    const imagesInput = $("gen-images");
+    const max = schema.maxInputImages || 1;
+    imagesInput.multiple = max > 1;
+    $("gen-images-hint").textContent = `up to ${max} image(s) for this tool`;
+  }
+
+  $("load-schema-btn").onclick = async () => {
+    const featureType = $("gen-feature-type").value.trim();
+    if (!featureType) return log("GET schema", { error: "feature_type required" });
+
+    const { status, data } = await call("GET", `/tools/${featureType}/schema`, { auth: true });
+    if (status !== 200) {
+      currentSchema = null;
+      $("gen-fields").innerHTML = "";
+      $("gen-schema-info").textContent = "Failed to load schema -- see log.";
+      return;
+    }
+
+    currentSchema = data;
+    $("gen-schema-info").textContent =
+      `Loaded "${data.featureType}" -- ${data.paramSchema.length} field(s), max ${data.maxInputImages} image(s).`;
+    renderSchemaFields(data);
+  };
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  function renderBatchStatus(batchId, batch) {
+    const box = $("gen-result");
+    const jobs = batch.jobs || [];
+    const allTerminal = jobs.length > 0 && jobs.every(j => j.status === "completed" || j.status === "failed");
+
+    box.innerHTML = "";
+    const title = document.createElement("div");
+    title.innerHTML = `<b>batchId:</b> ${batchId} ${allTerminal ? "(done)" : "(polling every 3s...)"}`;
+    box.appendChild(title);
+
+    for (const job of jobs) {
+      const row = document.createElement("div");
+      row.style.margin = "6px 0";
+      row.style.padding = "6px";
+      row.style.border = "1px solid #ddd";
+      row.style.borderRadius = "6px";
+      let html = `<b>${job.jobId}</b> -- ${job.status}`;
+      if (job.errorMessage) html += ` -- <span style="color:#b91c1c">${job.errorMessage}</span>`;
+      row.innerHTML = html;
+      if (job.outputUrl) {
+        const img = document.createElement("img");
+        img.src = job.outputUrl;
+        img.style.maxWidth = "160px";
+        img.style.display = "block";
+        img.style.marginTop = "4px";
+        row.appendChild(img);
+      }
+      box.appendChild(row);
+
+      // Point the webhook helper at the most recent job so a manual signed
+      // test webhook can be aimed at it directly.
+      $("gen-webhook-url").textContent = `POST ${BACKEND_URL}/webhooks/fal?job_id=${job.jobId}`;
+    }
+
+    if (allTerminal) stopPolling();
+  }
+
+  function startPollingBatch(batchId) {
+    stopPolling();
+    const poll = async () => {
+      const { status, data } = await call("GET", `/batches/${batchId}`, { auth: true });
+      if (status === 200) renderBatchStatus(batchId, data);
+      else stopPolling();
+    };
+    poll();
+    pollTimer = setInterval(poll, 3000);
+  }
+
+  $("gen-submit-btn").onclick = async () => {
+    const teamId = $("gen-team-id").value.trim();
+    const featureType = $("gen-feature-type").value.trim();
+    const images = $("gen-images").files;
+
+    if (!teamId || !featureType) return log("POST /generate", { error: "team_id and feature_type required" });
+    if (!images || images.length === 0) return log("POST /generate", { error: "select at least one image" });
+    if (!currentSchema) return log("POST /generate", { error: "load the tool's schema first" });
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", featureType);
+    formData.append("output_count", $("gen-output-count").value || "1");
+
+    for (const field of currentSchema.paramSchema || []) {
+      const el = document.getElementById(`gen-field-${field.name}`);
+      const value = el ? el.value.trim() : "";
+      if (value) formData.append(field.name, value);
+    }
+
+    for (const file of images) formData.append("images", file);
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.batchId) return;
+
+    startPollingBatch(data.batchId);
+  };
+
+  $("lookup-job-btn").onclick = () => {
+    const jobId = $("lookup-job-id").value.trim();
+    if (!jobId) return log("GET job", { error: "jobId required" });
+    return call("GET", `/jobs/${jobId}`, { auth: true });
+  };
 </script>
 
 </body>

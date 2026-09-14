@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     public_backend_url: str
     supabase_url: str
     supabase_service_role_key: str
+    fal_concurrency_limit: int
+    fal_per_team_concurrency_limit: int
 
     @property
     def cors_origins_list(self) -> list[str]:
