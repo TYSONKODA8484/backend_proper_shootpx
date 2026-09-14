@@ -21,6 +21,68 @@ from app.tools.registry import TOOL_HANDLERS
 
 logger = logging.getLogger(__name__)
 
+# Our param_schema exposes user-facing values (Recolor's Photoroom-style
+# standard/advanced/premium tiers, plain aspect-ratio strings) that must stay
+# exactly as-is -- they're what's stored in job.input_params for display and
+# what _resolve_credit_cost keys off of. fal.ai's real API takes neither
+# verbatim: openai/gpt-image-2/edit's `quality` only accepts
+# auto/low/medium/high, and its `image_size` only accepts a fixed set of
+# named presets (or an explicit {width, height} object) -- confirmed against
+# https://fal.ai/models/openai/gpt-image-2/edit/api. These tables are
+# currently written against exactly that model's vocabulary; if a future tool
+# reuses the "quality"/"size" field names with different values against a
+# different fal model, this translation would need to become per-tool rather
+# than global.
+FAL_QUALITY_TRANSLATION = {
+    "standard": "low",
+    "advanced": "medium",
+    "premium": "high",
+}
+
+# fal has no named preset for a plain 2:3 / 3:2 ratio, so those fall back to
+# an explicit {width, height} object. Constraints (per the docs above): both
+# dimensions multiples of 16, max edge 3840px, aspect ratio <= 3:1, total
+# pixels between 655,360 and 8,294,400 -- 1024x1536 (and its 1536x1024 swap)
+# satisfy all four comfortably.
+FAL_SIZE_TRANSLATION = {
+    "original": "auto",
+    "1:1": "square_hd",
+    "9:16": "portrait_16_9",
+    "3:4": "portrait_4_3",
+    "4:3": "landscape_4_3",
+    "16:9": "landscape_16_9",
+    "2:3": {"width": 1024, "height": 1536},
+    "3:2": {"width": 1536, "height": 1024},
+}
+
+# "color" and "target_area" are Recolor's own UI/schema fields, already
+# consumed by build_instruction() (above, in the caller) to produce the
+# `prompt` string -- they are not part of gpt-image-2/edit's real input
+# schema (prompt, image_urls, image_size, background, quality, num_images,
+# output_format, sync_mode, mask_url) and must not be forwarded raw.
+FAL_NON_SCHEMA_FIELDS = {"color", "target_area"}
+
+
+def _translate_fal_params(params: dict) -> dict:
+    """
+    Applied only to the payload actually sent to fal.ai -- the caller's own
+    dict (job.input_params) is never mutated, so the user-facing quality/size
+    values remain untouched for display and for credit-cost lookup.
+    """
+    translated = dict(params)
+
+    if "quality" in translated:
+        translated["quality"] = FAL_QUALITY_TRANSLATION.get(translated["quality"], translated["quality"])
+
+    if "size" in translated:
+        size = translated.pop("size")
+        translated["image_size"] = FAL_SIZE_TRANSLATION.get(size, size)
+
+    for field in FAL_NON_SCHEMA_FIELDS:
+        translated.pop(field, None)
+
+    return translated
+
 
 async def refill_due_subscriptions(ctx):
     db = SessionLocal()
@@ -141,6 +203,8 @@ async def submit_generation_to_fal(ctx, job_id: str):
                 params = {**job.input_params, "prompt": instruction}
             else:
                 params = job.input_params
+
+            params = _translate_fal_params(params)
 
             fal_request_id = submit_to_fal(tool.fal_model_id, params, webhook_url)
             job.fal_request_id = fal_request_id

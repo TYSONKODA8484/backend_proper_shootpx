@@ -21,7 +21,7 @@ def _tool_definition(ai_steps=None):
 
 VISION_STEP = {
     "model": "fal-ai/moondream-next",
-    "task_type": "detection",
+    "task_type": "query",  # moondream-next's `prompt` field is only used for task_type="query"
     "prompt_template": "Find the main product and recolor it to {color}",
 }
 
@@ -48,7 +48,11 @@ def test_given_target_area_builds_instruction_directly_without_a_vision_call(mon
 # --------------------------------------------------------------------------- #
 
 def test_blank_target_area_calls_the_configured_vision_model(monkeypatch):
-    call_fal_sync = MagicMock(return_value={"answer": "Recolor the sneaker sole to color red"})
+    """moondream-next's real schema (confirmed against
+    https://fal.ai/models/fal-ai/moondream-next/api): the prompt field is
+    named `prompt` (not `query`), and the response comes back as
+    {"output": ...} (not {"answer": ...})."""
+    call_fal_sync = MagicMock(return_value={"output": "Recolor the sneaker sole to color red"})
     monkeypatch.setattr(recolor, "call_fal_sync", call_fal_sync)
 
     job = _job(color="red", target_area=None, image_urls=["https://fal.test/first.png", "https://fal.test/second.png"])
@@ -60,9 +64,9 @@ def test_blank_target_area_calls_the_configured_vision_model(monkeypatch):
     call_fal_sync.assert_called_once_with(
         model_id="fal-ai/moondream-next",
         input_params={
-            "task_type": "detection",
+            "task_type": "query",
             "image_url": "https://fal.test/first.png",  # first image, even with multiple uploaded
-            "query": "Find the main product and recolor it to red",
+            "prompt": "Find the main product and recolor it to red",
         },
     )
 
@@ -96,7 +100,7 @@ def test_blank_target_area_skips_the_vision_call_when_no_detect_target_step_conf
 def test_blank_target_area_with_no_uploaded_images_still_calls_vision_with_null_url(monkeypatch):
     """Should never happen in practice (images are required on /generate), but
     must not raise an IndexError if input_params ever arrives with an empty list."""
-    call_fal_sync = MagicMock(return_value={"answer": "fallback answer"})
+    call_fal_sync = MagicMock(return_value={"output": "fallback answer"})
     monkeypatch.setattr(recolor, "call_fal_sync", call_fal_sync)
 
     job = _job(color="red", target_area=None, image_urls=[])

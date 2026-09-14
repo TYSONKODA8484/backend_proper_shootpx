@@ -1,5 +1,10 @@
+import logging
+
 import httpx
+
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def submit_to_fal(model_id: str, input_params: dict, webhook_url: str) -> str:
@@ -10,7 +15,14 @@ def submit_to_fal(model_id: str, input_params: dict, webhook_url: str) -> str:
         json=input_params,
         timeout=30,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        # The exception's own str() only has the status code -- fal's response
+        # body is where the actual reason (bad param, rejected image, etc.)
+        # lives. Server logs only; job.error_message stays generic.
+        logger.exception("fal.ai submit rejected [%s]: %s", response.status_code, response.text)
+        raise
     return response.json()["request_id"]
 
 def call_fal_sync(model_id: str, input_params: dict) -> dict:
@@ -26,7 +38,11 @@ def call_fal_sync(model_id: str, input_params: dict) -> dict:
         json=input_params,
         timeout=30,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        logger.exception("fal.ai sync call rejected [%s]: %s", response.status_code, response.text)
+        raise
     return response.json()
 
 def upload_image_to_fal(file_bytes: bytes, filename: str, content_type: str) -> str:

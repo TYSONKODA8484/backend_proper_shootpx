@@ -32,8 +32,9 @@ def build_instruction(job, tool_definition) -> str:
         input_params={
             "task_type": vision_step["task_type"],
             "image_url": image_url,
-            "query": prompt,
+            "prompt": prompt,  # moondream-next's real field is "prompt", not "query"
         },
     )
 
-    return result.get("answer") or f"Recolor the main product to color {color}"
+    # moondream-next's real output schema is {"output": "..."} -- not "answer"
+    return result.get("output") or f"Recolor the main product to color {color}"
