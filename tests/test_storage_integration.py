@@ -3,6 +3,7 @@ output_url, and every failure path along that chain refunds + fails cleanly.
 """
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,7 +13,7 @@ from app.core.storage import upload_to_storage
 from app.services import generation as generation_svc
 
 
-def _job(status="queued", credits_charged=5, from_sub=3, from_topup=2):
+def _job(status="queued", credits_charged=5, from_sub=3, from_topup=2, seconds_old=12):
     return MagicMock(
         status=status,
         credits_charged=credits_charged,
@@ -24,12 +25,13 @@ def _job(status="queued", credits_charged=5, from_sub=3, from_topup=2):
         user_id=uuid.uuid4(),
         output_url=None,
         error_message=None,
+        created_at=datetime.now(timezone.utc) - timedelta(seconds=seconds_old),
     )
 
 
 def _webhook_db(job, remaining_in_batch=0):
     db = MagicMock()
-    (db.query.return_value.filter.return_value
+    (db.query.return_value.filter.return_value.populate_existing.return_value
        .with_for_update.return_value.first.return_value) = job
     db.query.return_value.filter.return_value.count.return_value = remaining_in_batch
     return db
@@ -143,6 +145,99 @@ def test_download_and_upload_failures_use_distinct_messages():
     """The two messages must actually differ -- that's the whole point."""
     from app.services.generation import DOWNLOAD_FAILED_MESSAGE, UPLOAD_FAILED_MESSAGE
     assert DOWNLOAD_FAILED_MESSAGE != UPLOAD_FAILED_MESSAGE
+
+
+# --------------------------------------------------------------------------- #
+# duration_seconds: populated for every terminal outcome, completed_at - created_at.
+# --------------------------------------------------------------------------- #
+
+def test_duration_seconds_populated_on_successful_completion(monkeypatch):
+    job = _job(seconds_old=12)
+    db = _webhook_db(job)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    monkeypatch.setattr(generation_svc, "download_from_url", MagicMock(return_value=b"bytes"))
+    monkeypatch.setattr(generation_svc, "upload_to_storage", MagicMock(return_value="https://stored.test/x.png"))
+
+    generation_svc.handle_fal_webhook(db, uuid.uuid4(), _ok_payload())
+
+    assert job.status == "completed"
+    assert job.duration_seconds == int((job.completed_at - job.created_at).total_seconds())
+    assert 11 <= job.duration_seconds <= 13  # ~12s, small tolerance for real wall-clock time
+
+
+def test_late_webhook_success_after_timeout_failure_delivers_output_without_recharging(monkeypatch):
+    """The other half of the timeout money-loss fix (see app/worker.py's
+    check_generation_timeouts): a job already failed+refunded by a timeout
+    can still have the REAL fal.ai webhook show up afterward reporting
+    success. It must be delivered -- completed, with the real output -- but
+    credits must NOT be charged again; the timeout's own refund stands."""
+    from app.services.generation import TIMEOUT_MESSAGE
+
+    job = _job(status="failed", seconds_old=90)
+    job.error_message = TIMEOUT_MESSAGE
+    job.output_url = None
+    db = _webhook_db(job)
+    download = MagicMock(return_value=b"real-bytes")
+    upload = MagicMock(return_value="https://our-storage.test/permanent/late.png")
+    monkeypatch.setattr(generation_svc, "download_from_url", download)
+    monkeypatch.setattr(generation_svc, "upload_to_storage", upload)
+    refund = MagicMock()
+    release = MagicMock()
+    release_slot = MagicMock()
+    monkeypatch.setattr(generation_svc, "refund_credits", refund)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", release)
+    monkeypatch.setattr(generation_svc, "release_fal_slot", release_slot)
+
+    generation_svc.handle_fal_webhook(
+        db, uuid.uuid4(),
+        {"status": "OK", "payload": {"images": [{"url": "https://fal.test/late.png"}]}},
+    )
+
+    download.assert_called_once_with("https://fal.test/late.png")
+    upload.assert_called_once_with(f"{job.team_id}/{job.feature_type}/{job.id}/output.png", b"real-bytes")
+    assert job.status == "completed"
+    assert job.output_url == "https://our-storage.test/permanent/late.png"
+    refund.assert_not_called()           # no double-refund
+    release.assert_not_called()          # already released back when the timeout first failed it
+    release_slot.assert_not_called()     # same -- must not double-decrement the fal concurrency counter
+    db.commit.assert_called_once()
+
+
+def test_late_webhook_failure_after_timeout_failure_is_a_safe_noop(monkeypatch):
+    """A late webhook reporting FAILURE (not success) for an already
+    timed-out-and-refunded job has nothing new to deliver -- must stay a
+    silent no-op exactly like before, not attempt a second refund."""
+    from app.services.generation import TIMEOUT_MESSAGE
+
+    job = _job(status="failed", seconds_old=90)
+    job.error_message = TIMEOUT_MESSAGE
+    db = _webhook_db(job)
+    refund = MagicMock()
+    monkeypatch.setattr(generation_svc, "refund_credits", refund)
+
+    generation_svc.handle_fal_webhook(db, uuid.uuid4(), {"status": "ERROR", "error": "fal also failed"})
+
+    assert job.status == "failed"
+    assert job.error_message == TIMEOUT_MESSAGE  # untouched
+    refund.assert_not_called()
+    db.commit.assert_not_called()
+
+
+def test_duration_seconds_populated_on_failure(monkeypatch):
+    """A terminal FAILURE must get duration_seconds too, not just success --
+    the download-failure path exercised here reaches the same completed_at
+    line as every other outcome in handle_fal_webhook."""
+    job = _job(seconds_old=30)
+    db = _webhook_db(job)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    monkeypatch.setattr(generation_svc, "download_from_url", MagicMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(generation_svc, "refund_credits", MagicMock())
+
+    generation_svc.handle_fal_webhook(db, uuid.uuid4(), _ok_payload())
+
+    assert job.status == "failed"
+    assert job.duration_seconds == int((job.completed_at - job.created_at).total_seconds())
+    assert 29 <= job.duration_seconds <= 31
 
 
 # --------------------------------------------------------------------------- #

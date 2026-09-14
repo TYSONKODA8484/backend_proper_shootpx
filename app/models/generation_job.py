@@ -25,3 +25,4 @@ class GenerationJob(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
     credits_from_subscription = Column(Integer, nullable=False, default=0)
     credits_from_topup = Column(Integer, nullable=False, default=0)
+    duration_seconds = Column(Integer, nullable=True)

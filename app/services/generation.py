@@ -14,6 +14,16 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_FAILED_MESSAGE = "Could not retrieve the generated image. Please try again."
 UPLOAD_FAILED_MESSAGE = "Could not save the generated image. Please try again."
 
+# The exact error_message a job gets when worker.py fails it for running past
+# its own timeout budget (worker.check_generation_timeouts, the per-tool
+# check) or the flat 10-minute catch-all (worker.sweep_stale_generation_jobs).
+# Defined here (not in worker.py) so handle_fal_webhook below can recognize
+# "this job was failed+refunded specifically because of a timeout, not a real
+# fal.ai failure" without worker.py and generation.py importing each other.
+TIMEOUT_MESSAGE = "Generation took too long. Please try again."
+SWEEP_TIMEOUT_MESSAGE = "Generation timed out — no response received"
+TIMEOUT_FAILURE_MESSAGES = {TIMEOUT_MESSAGE, SWEEP_TIMEOUT_MESSAGE}
+
 
 def validate_input_params(param_schema: list, input_params: dict) -> None:
     for field in param_schema:
@@ -127,12 +137,58 @@ def fail_and_release(db: Session, job: GenerationJob, error_message: str) -> Non
     db.commit()
 
 
+def _deliver_late_success_after_timeout(db: Session, job: GenerationJob, payload: dict) -> None:
+    """
+    A job we already failed+refunded for running past its timeout budget
+    (see TIMEOUT_FAILURE_MESSAGES) has now had the REAL fal.ai webhook arrive
+    reporting success -- fal actually finished the work. Deliver the real
+    output and mark it completed, but deliberately do NOT charge credits
+    again: the refund from the timeout stands, so this output is free. This
+    is the money-loss case the timeout mechanism can otherwise create (fail
+    the user's job, refund them, then fal quietly succeeds anyway and the
+    real result would previously just be discarded here).
+    """
+    images = payload.get("payload", {}).get("images", [])
+    fal_url = images[0]["url"] if images else None
+    if not fal_url:
+        return
+
+    try:
+        file_bytes = download_from_url(fal_url)
+        permanent_path = f"{job.team_id}/{job.feature_type}/{job.id}/output.png"
+        job.output_url = upload_to_storage(permanent_path, file_bytes)
+    except Exception:
+        logger.exception(
+            "late success webhook arrived for already-timed-out-and-refunded job %s, "
+            "but storing the real output failed -- job stays failed/refunded as-is",
+            job.id,
+        )
+        return
+
+    job.status = "completed"
+    db.commit()
+    logger.warning(
+        "job %s: late success delivered free of charge -- fal.ai's real webhook "
+        "reported success after this job was already failed+refunded by a timeout; "
+        "output stored, credits NOT re-charged (the timeout refund stands)",
+        job.id,
+    )
+
+
 def handle_fal_webhook(db: Session, job_id, payload: dict):
-    job = db.query(GenerationJob).filter(GenerationJob.id == job_id).with_for_update().first()
+    job = db.query(GenerationJob).filter(
+        GenerationJob.id == job_id
+    ).populate_existing().with_for_update().first()
     if not job:
         return
 
     if job.status in ("completed", "failed"):
+        if (
+            job.status == "failed"
+            and job.error_message in TIMEOUT_FAILURE_MESSAGES
+            and payload.get("status") == "OK"
+        ):
+            _deliver_late_success_after_timeout(db, job, payload)
         return
 
     if payload.get("status") == "OK":
@@ -167,6 +223,7 @@ def handle_fal_webhook(db: Session, job_id, payload: dict):
         refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
 
     job.completed_at = datetime.now(timezone.utc)
+    job.duration_seconds = int((job.completed_at - job.created_at).total_seconds())
 
     remaining = db.query(GenerationJob).filter(
         GenerationJob.batch_id == job.batch_id,
