@@ -330,7 +330,7 @@ def test_create_batch_charges_the_selected_tiers_credit_cost_not_the_flat_defaul
 # handle_fal_webhook — success/failure/refund-split/idempotent replay
 # --------------------------------------------------------------------------- #
 
-def _job(status="queued", credits_charged=5, from_sub=3, from_topup=2, batch_id=None):
+def _job(status="queued", credits_charged=5, from_sub=3, from_topup=2, batch_id=None, fal_request_id=None):
     return MagicMock(
         status=status,
         credits_charged=credits_charged,
@@ -341,6 +341,7 @@ def _job(status="queued", credits_charged=5, from_sub=3, from_topup=2, batch_id=
         batch_id=batch_id or uuid.uuid4(),
         output_url=None,
         error_message=None,
+        fal_request_id=fal_request_id,
     )
 
 
@@ -355,6 +356,73 @@ def _webhook_db(job, remaining_in_batch=0):
        .with_for_update.return_value.first.return_value) = job
     db.query.return_value.filter.return_value.count.return_value = remaining_in_batch
     return db
+
+
+# --------------------------------------------------------------------------- #
+# request_id correlation: a genuinely fal-signed webhook for a DIFFERENT
+# request must never be applied to this job (replay / cross-job substitution).
+# --------------------------------------------------------------------------- #
+
+def test_webhook_with_mismatched_request_id_is_ignored(monkeypatch):
+    """Real gap found live: ?job_id=... isn't part of what fal signs, so
+    nothing previously stopped a genuinely fal-signed webhook for one request
+    being replayed onto a different job_id. Must be rejected before touching
+    status/credits/lock at all."""
+    job = _job(status="processing", fal_request_id="fal-req-REAL")
+    db = _webhook_db(job)
+    refund = MagicMock()
+    release = MagicMock()
+    monkeypatch.setattr(generation_svc, "refund_credits", refund)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", release)
+
+    generation_svc.handle_fal_webhook(
+        db, uuid.uuid4(),
+        {"status": "OK", "request_id": "fal-req-ATTACKERS-OWN",
+         "payload": {"images": [{"url": "https://attacker.test/x.png"}]}},
+    )
+
+    assert job.status == "processing"  # untouched
+    refund.assert_not_called()
+    release.assert_not_called()
+    db.commit.assert_not_called()
+
+
+def test_webhook_with_matching_request_id_still_works(monkeypatch):
+    """Regression check: the correlation check must not break the normal path."""
+    job = _job(status="processing", fal_request_id="fal-req-REAL")
+    db = _webhook_db(job)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    monkeypatch.setattr(generation_svc, "download_from_url", MagicMock(return_value=b"bytes"))
+    monkeypatch.setattr(generation_svc, "upload_to_storage",
+                         MagicMock(return_value="https://our-storage.test/ok.png"))
+
+    generation_svc.handle_fal_webhook(
+        db, uuid.uuid4(),
+        {"status": "OK", "request_id": "fal-req-REAL",
+         "payload": {"images": [{"url": "https://fal.test/ok.png"}]}},
+    )
+
+    assert job.status == "completed"
+
+
+def test_webhook_without_a_request_id_field_is_not_rejected(monkeypatch):
+    """Our own internal delivery (worker.check_generation_timeouts resolving
+    a job via fal's real status API, not an actual HTTP webhook) always sets
+    request_id correctly -- but stay permissive if it's ever absent rather
+    than fail closed on a missing field that isn't itself suspicious."""
+    job = _job(status="processing", fal_request_id="fal-req-REAL")
+    db = _webhook_db(job)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    monkeypatch.setattr(generation_svc, "download_from_url", MagicMock(return_value=b"bytes"))
+    monkeypatch.setattr(generation_svc, "upload_to_storage",
+                         MagicMock(return_value="https://our-storage.test/ok.png"))
+
+    generation_svc.handle_fal_webhook(
+        db, uuid.uuid4(),
+        {"status": "OK", "payload": {"images": [{"url": "https://fal.test/ok.png"}]}},
+    )
+
+    assert job.status == "completed"
 
 
 def test_webhook_success_completes_job_and_releases_lock(monkeypatch):
@@ -641,6 +709,92 @@ def test_generate_rejects_more_images_than_the_tools_max_input_images(gen_client
     assert res.status_code == 400
     assert "at most 1" in res.json()["detail"]
     upload.assert_not_called()  # rejected before uploading anything to fal's CDN
+
+
+# --------------------------------------------------------------------------- #
+# /generate: schema validation + image checks must happen BEFORE any fal
+# upload cost is paid -- a request that's going to be rejected anyway
+# shouldn't burn real fal.ai upload quota every time.
+# --------------------------------------------------------------------------- #
+
+def test_generate_rejects_output_count_over_the_cap_before_any_upload(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=5, param_schema=[])
+    upload = MagicMock()
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool", "output_count": "9999"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 400
+    assert "output_count" in res.json()["detail"]
+    upload.assert_not_called()
+
+
+def test_generate_rejects_missing_required_field_before_any_upload(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        max_input_images=5,
+        param_schema=[{"name": "color", "type": "color", "label": "Color", "required": True}],
+    )
+    upload = MagicMock()
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "recolor"},  # no "color" field sent
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 400
+    assert "Missing required field: Color" in res.json()["detail"]
+    upload.assert_not_called()  # rejected before ever touching fal's CDN
+
+
+def test_generate_rejects_disallowed_image_content_type_before_any_upload(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=5, param_schema=[])
+    upload = MagicMock()
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool"},
+        files=[("images", ("payload.exe", b"not-an-image", "application/x-msdownload"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 400
+    assert "Unsupported image type" in res.json()["detail"]
+    upload.assert_not_called()
+
+
+def test_generate_rejects_oversized_image_before_any_upload(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=5, param_schema=[])
+    upload = MagicMock()
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+    monkeypatch.setattr("app.routes.generation.MAX_IMAGE_SIZE_BYTES", 10)  # tiny, for the test
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool"},
+        files=[("images", ("big.png", b"way more than ten bytes of data", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 400
+    assert "MB limit" in res.json()["detail"]
+    upload.assert_not_called()
 
 
 def test_generate_uploads_every_image_and_passes_all_urls_through(gen_client, monkeypatch):

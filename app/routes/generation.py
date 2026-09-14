@@ -12,11 +12,23 @@ from app.core.limiter import limiter
 from app.deps import get_current_user
 from app.models.user import User
 from app.services.teams import is_team_member
-from app.services.generation import create_generation_batch, fail_and_release, handle_fal_webhook
+from app.services.generation import create_generation_batch, fail_and_release, handle_fal_webhook, validate_input_params
 from app.models.generation_job import GenerationJob
 from app.models.tool_definition import ToolDefinition
 from app.core.arq_pool import get_arq_pool
 from app.core.fal_client import upload_image_to_fal
+
+# 10 MB/image is generous for a product photo while still bounding memory use
+# (await image.read() loads the whole file) and fal upload cost for obviously
+# bad input.
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+ALLOWED_IMAGE_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp"}
+
+# output_count was previously bounded only by the team's credit balance, not
+# by any sane per-request cap -- a typo (an extra zero) could create an
+# enormous batch (thousands of DB rows + arq jobs) in one call for any team
+# with enough credits. This is a request-shape limit, independent of cost.
+MAX_OUTPUT_COUNT = 20
 
 router = APIRouter(tags=["generation"])
 
@@ -58,10 +70,46 @@ async def generate(
             detail=f"This tool accepts at most {tool_check.max_input_images} image(s)",
         )
 
-    image_urls = []
+    if output_count > MAX_OUTPUT_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"output_count cannot exceed {MAX_OUTPUT_COUNT} per request",
+        )
+
+    # Validate the tool's own required/select fields (e.g. a missing color)
+    # BEFORE paying to upload anything to fal -- a request that's going to be
+    # rejected here shouldn't cost real fal upload quota every time.
+    try:
+        validate_input_params(
+            tool_check.param_schema,
+            {"color": color, "quality": quality, "size": size, "target_area": target_area},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Read + validate every image BEFORE uploading any of them -- same
+    # reasoning: don't pay fal upload cost for a request that's about to be
+    # rejected anyway (disallowed type, oversized file).
+    read_images = []
     for image in images:
+        if image.content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported image type: {image.content_type}. "
+                       f"Allowed: {', '.join(sorted(ALLOWED_IMAGE_CONTENT_TYPES))}",
+            )
         file_bytes = await image.read()
-        image_urls.append(upload_image_to_fal(file_bytes, image.filename, image.content_type))
+        if len(file_bytes) > MAX_IMAGE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{image.filename} is over the {MAX_IMAGE_SIZE_BYTES // (1024 * 1024)}MB limit per image",
+            )
+        read_images.append((file_bytes, image.filename, image.content_type))
+
+    image_urls = [
+        upload_image_to_fal(file_bytes, filename, content_type)
+        for file_bytes, filename, content_type in read_images
+    ]
 
     input_params = {
         "color": color,
@@ -139,6 +187,7 @@ def get_batch(
 
 
 @router.post("/webhooks/fal")
+@limiter.limit("120/minute")
 async def fal_webhook(request: Request, job_id: UUID, db: Session = Depends(get_db)):
     raw_body = await request.body()
 
@@ -150,28 +199,3 @@ async def fal_webhook(request: Request, job_id: UUID, db: Session = Depends(get_
     payload = json.loads(raw_body)
     handle_fal_webhook(db, job_id, payload)
     return {"status": "ok"}
-
-def validate_input_params(param_schema: list, input_params: dict) -> None:
-    """
-    Checks the incoming request against this tool's own param_schema —
-    catches a missing required field or an invalid select option BEFORE
-    any credits are charged or any job is created.
-    """
-    for field in param_schema:
-        name = field["name"]
-        value = input_params.get(name)
-
-        if field.get("required") and not value:
-            raise ValueError(f"Missing required field: {field['label']}")
-
-        if field["type"] == "select" and value:
-            options = field.get("options", [])
-            # options can be a list of plain strings, OR a list of dicts
-            # with a "value" key (used when each option carries its own
-            # credit_cost, like Recolor's quality tiers)
-            valid_values = [
-                opt["value"] if isinstance(opt, dict) else opt
-                for opt in options
-            ]
-            if value not in valid_values:
-                raise ValueError(f"Invalid value for {field['label']}: {value}")

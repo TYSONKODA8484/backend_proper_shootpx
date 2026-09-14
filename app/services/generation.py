@@ -182,6 +182,22 @@ def handle_fal_webhook(db: Session, job_id, payload: dict):
     if not job:
         return
 
+    # The URL's job_id (?job_id=...) is our OWN identifier, not part of what
+    # fal.ai signs -- verify_fal_webhook only proves this payload genuinely
+    # came from fal for SOME request, not that it's for THIS job. Without
+    # this check, a real (fal-signed) webhook for one job could be replayed
+    # onto a completely different job_id within the signature's replay
+    # window, letting an authenticated user overwrite/complete/fail another
+    # team's job with their own request's content.
+    incoming_request_id = payload.get("request_id")
+    if job.fal_request_id and incoming_request_id and incoming_request_id != job.fal_request_id:
+        logger.warning(
+            "job %s: webhook request_id %r does not match this job's own "
+            "fal_request_id %r -- ignoring (misdirected or replayed delivery)",
+            job.id, incoming_request_id, job.fal_request_id,
+        )
+        return
+
     if job.status in ("completed", "failed"):
         if (
             job.status == "failed"

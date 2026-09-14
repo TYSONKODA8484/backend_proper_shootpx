@@ -310,14 +310,29 @@ def handle_subscription_charged(db: Session, event: dict) -> None:
                 if owner_membership:
                     owner = db.query(User).filter(User.id == owner_membership.user_id).first()
                     if owner:
-                        send_email(
-                            to=owner.email,
-                            subject="Your ShootPX plan is ending soon",
-                            html=(
-                                f"Your current plan will complete after your next billing cycle. "
-                                f"Renew to keep your credits flowing: {settings.frontend_url}/billing"
-                            ),
-                        )
+                        # Best-effort only: this is a courtesy notice, not part
+                        # of the billing state transition above (already
+                        # staged, about to commit). If SMTP is down, the email
+                        # is lost -- log it and move on rather than let it
+                        # raise, which would otherwise surface as an unhandled
+                        # 500 to Razorpay for a webhook that actually
+                        # succeeded, and since last_paid_count already
+                        # advanced, a retry would never re-attempt the email.
+                        try:
+                            send_email(
+                                to=owner.email,
+                                subject="Your ShootPX plan is ending soon",
+                                html=(
+                                    f"Your current plan will complete after your next billing cycle. "
+                                    f"Renew to keep your credits flowing: {settings.frontend_url}/billing"
+                                ),
+                            )
+                        except Exception:
+                            logger.error(
+                                "Failed to send renewal-notice email for team %s (owner %s) -- "
+                                "not retried, since last_paid_count already advances past this point.",
+                                team_sub.team_id, owner.id, exc_info=True,
+                            )
     # Yearly plans: a renewal charge only extends current_period_end. The 12
     # monthly slices between once-a-year charges are delivered by the daily
     # refill_due_subscriptions scheduler in worker.py.
