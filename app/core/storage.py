@@ -1,7 +1,10 @@
+import logging
 import re
 
 import httpx
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 BUCKET_NAME = "generation-storage"
 
@@ -39,7 +42,16 @@ def upload_to_storage(file_path: str, file_bytes: bytes, content_type: str = "im
         content=file_bytes,
         timeout=30,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        # The exception's own str() only has the status code -- Supabase's
+        # response body is where the real reason (bad bucket, RLS rejection,
+        # bad key) lives. Caller (handle_fal_webhook) already stores only a
+        # generic message on the job; this is what makes the real cause
+        # visible in server logs.
+        logger.exception("Supabase storage upload rejected [%s]: %s", response.status_code, response.text)
+        raise
 
     return f"{settings.supabase_url}/storage/v1/object/public/{BUCKET_NAME}/{file_path}"
 
@@ -50,5 +62,9 @@ def download_from_url(url: str) -> bytes:
     it expires, so we can re-upload it to our own permanent storage).
     """
     response = httpx.get(url, timeout=30)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        logger.exception("Failed to download fal.ai output [%s]: %s", response.status_code, response.text)
+        raise
     return response.content
