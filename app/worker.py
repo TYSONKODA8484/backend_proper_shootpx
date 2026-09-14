@@ -28,23 +28,16 @@ from app.tools.registry import TOOL_HANDLERS
 
 logger = logging.getLogger(__name__)
 
-# Our param_schema exposes user-facing values (Recolor's Photoroom-style
-# standard/advanced/premium tiers, plain aspect-ratio strings) that must stay
-# exactly as-is -- they're what's stored in job.input_params for display and
-# what _resolve_credit_cost keys off of. fal.ai's real API takes neither
-# verbatim: openai/gpt-image-2/edit's `quality` only accepts
-# auto/low/medium/high, and its `image_size` only accepts a fixed set of
-# named presets (or an explicit {width, height} object) -- confirmed against
-# https://fal.ai/models/openai/gpt-image-2/edit/api. These tables are
-# currently written against exactly that model's vocabulary; if a future tool
-# reuses the "quality"/"size" field names with different values against a
-# different fal model, this translation would need to become per-tool rather
-# than global.
-FAL_QUALITY_TRANSLATION = {
-    "standard": "low",
-    "advanced": "medium",
-    "premium": "high",
-}
+# Recolor's param_schema now stores "quality" as fal's own real values
+# (auto/low/medium/high, matching openai/gpt-image-2/edit's actual accepted
+# vocabulary directly) -- no translation needed for that field any more. Size
+# is still our own plain aspect-ratio strings ("9:16", etc.), which DO need
+# translating: fal's `image_size` only accepts a fixed set of named presets
+# (or an explicit {width, height} object) -- confirmed against
+# https://fal.ai/models/openai/gpt-image-2/edit/api. This table is currently
+# written against exactly that model's vocabulary; if a future tool reuses
+# the "size" field name with different values against a different fal model,
+# this translation would need to become per-tool rather than global.
 
 # fal has no named preset for a plain 2:3 / 3:2 ratio, so those fall back to
 # an explicit {width, height} object. Constraints (per the docs above): both
@@ -73,13 +66,11 @@ FAL_NON_SCHEMA_FIELDS = {"color", "target_area"}
 def _translate_fal_params(params: dict) -> dict:
     """
     Applied only to the payload actually sent to fal.ai -- the caller's own
-    dict (job.input_params) is never mutated, so the user-facing quality/size
-    values remain untouched for display and for credit-cost lookup.
+    dict (job.input_params) is never mutated, so the user-facing size value
+    remains untouched for display and quality remains untouched for both
+    display and _resolve_credit_cost's lookup (it's already fal's real value).
     """
     translated = dict(params)
-
-    if "quality" in translated:
-        translated["quality"] = FAL_QUALITY_TRANSLATION.get(translated["quality"], translated["quality"])
 
     if "size" in translated:
         size = translated.pop("size")

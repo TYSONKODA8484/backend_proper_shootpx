@@ -149,16 +149,17 @@ def test_duplicate_run_after_success_does_not_resubmit(monkeypatch):
     refund.assert_not_called()             # and definitely no refund fired
 
 
-def test_submit_translates_quality_and_size_before_sending_to_fal(monkeypatch):
-    """The params dict actually sent to fal.ai must carry the translated
-    values (low/medium/high, image_size preset) -- job.input_params (read
-    back via GET /jobs and /batches) must keep the original user-facing
-    values untouched."""
+def test_submit_translates_size_and_passes_quality_through_before_sending_to_fal(monkeypatch):
+    """The params dict actually sent to fal.ai must carry the translated size
+    (image_size preset) -- quality is stored as fal's own real enum value
+    directly (auto/low/medium/high) now, so it must reach fal unchanged, not
+    translated. job.input_params (read back via GET /jobs and /batches) must
+    keep the original user-facing values untouched either way."""
     job = MagicMock(
         id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
         feature_type="test_tool",  # no TOOL_HANDLERS entry -- isolates the translation step itself
         credits_charged=5, credits_from_subscription=3, credits_from_topup=2,
-        input_params={"color": "red", "quality": "premium", "size": "9:16"},
+        input_params={"color": "red", "quality": "high", "size": "9:16"},
     )
     original_input_params = dict(job.input_params)
     tool = _tool()
@@ -174,7 +175,7 @@ def test_submit_translates_quality_and_size_before_sending_to_fal(monkeypatch):
 
     assert job.status == "processing"
     sent_params = submit.call_args.args[1]
-    assert sent_params["quality"] == "high"          # premium -> high
+    assert sent_params["quality"] == "high"              # already fal's real value -- unchanged
     assert sent_params["image_size"] == "portrait_16_9"  # 9:16 -> portrait_16_9
     assert "size" not in sent_params
 
