@@ -14,3 +14,5 @@ class ToolDefinition(Base):
     credit_cost_per_output = Column(Integer, nullable=False)
     param_schema = Column(JSONB, nullable=False, default=dict)
     is_active = Column(Boolean, nullable=False, default=True)
+    ai_steps = Column(JSONB, nullable=False, default=dict)
+    stage = Column(Integer, nullable=False, default=1)

@@ -5,21 +5,50 @@ from sqlalchemy.orm import Session
 
 from app.models.generation_job import GenerationJob
 from app.models.tool_definition import ToolDefinition
-from app.services.generation_lock import acquire_generation_lock, release_generation_lock
+from app.services.generation_lock import acquire_generation_lock, release_generation_lock, release_fal_slot
 from app.services.credits import spend_credits, refund_credits
 from app.core.storage import upload_to_storage, download_from_url
 
 logger = logging.getLogger(__name__)
 
-# job.error_message is returned verbatim to any team member via GET /jobs/{id}
-# and GET /batches/{id} -- these must always be fixed, generic strings, never
-# raw exception text (that lesson came from a real FAL_KEY leak found earlier
-# in this pipeline's audit). The real exception detail is logged server-side
-# via logger.exception() instead, distinguishing the two failure points so
-# support/ops can tell a dead fal.ai temp URL apart from a broken storage
-# bucket without ever exposing either to the client.
 DOWNLOAD_FAILED_MESSAGE = "Could not retrieve the generated image. Please try again."
 UPLOAD_FAILED_MESSAGE = "Could not save the generated image. Please try again."
+
+
+def validate_input_params(param_schema: list, input_params: dict) -> None:
+    for field in param_schema:
+        name = field["name"]
+        value = input_params.get(name)
+
+        if field.get("required") and not value:
+            raise ValueError(f"Missing required field: {field['label']}")
+
+        if field["type"] == "select" and value:
+            options = field.get("options", [])
+            valid_values = [
+                opt["value"] if isinstance(opt, dict) else opt
+                for opt in options
+            ]
+            if value not in valid_values:
+                raise ValueError(f"Invalid value for {field['label']}: {value}")
+
+
+def _resolve_credit_cost(param_schema: list, input_params: dict, fallback_cost: int) -> int:
+    for field in param_schema:
+        if field["type"] != "select":
+            continue
+        options = field.get("options", [])
+        if not options or not isinstance(options[0], dict):
+            continue
+        if "credit_cost" not in options[0]:
+            continue
+
+        selected_value = input_params.get(field["name"])
+        for opt in options:
+            if opt["value"] == selected_value:
+                return opt["credit_cost"]
+
+    return fallback_cost
 
 
 def create_generation_batch(db: Session, team_id, user_id, feature_type: str, input_params: dict, output_count: int = 1) -> list[GenerationJob]:
@@ -35,8 +64,11 @@ def create_generation_batch(db: Session, team_id, user_id, feature_type: str, in
         if not tool.is_active:
             raise ValueError("This tool is not currently available")
 
+        validate_input_params(tool.param_schema, input_params)
+
         output_count = output_count if output_count and output_count > 0 else tool.default_output_count
-        total_cost = tool.credit_cost_per_output * output_count
+        per_output_cost = _resolve_credit_cost(tool.param_schema, input_params, tool.credit_cost_per_output)
+        total_cost = per_output_cost * output_count
 
         _, from_subscription, from_topup = spend_credits(db, team_id, total_cost, commit=False)
 
@@ -55,7 +87,7 @@ def create_generation_batch(db: Session, team_id, user_id, feature_type: str, in
                 feature_type=feature_type,
                 input_params=input_params,
                 batch_id=batch_id,
-                credits_charged=tool.credit_cost_per_output,
+                credits_charged=per_output_cost,
                 credits_from_subscription=per_job_sub + (remainder_sub if i == 0 else 0),
                 credits_from_topup=per_job_top + (remainder_top if i == 0 else 0),
                 status="queued",
@@ -74,10 +106,10 @@ def create_generation_batch(db: Session, team_id, user_id, feature_type: str, in
 
 def fail_and_release(db: Session, job: GenerationJob, error_message: str) -> None:
     """
-    Used when a job was created and charged, but something after that point
-    failed before fal.ai was ever reached (e.g. arq/Redis unreachable at
-    enqueue time). Marks the job failed, refunds using its own exact stored
-    split, releases the lock if this was the last job in its batch.
+    Only used for the enqueue-failure path (/generate -> arq), before the job
+    has ever reached the worker -- so no fal slot was ever reserved for it
+    (that only happens inside submit_generation_to_fal). Must NOT call
+    release_fal_slot here, or it decrements a counter nothing incremented.
     """
     job.status = "failed"
     job.error_message = error_message
@@ -143,5 +175,6 @@ def handle_fal_webhook(db: Session, job_id, payload: dict):
 
     if remaining <= 1:
         release_generation_lock(job.user_id)
+        release_fal_slot(job.team_id)
 
     db.commit()
