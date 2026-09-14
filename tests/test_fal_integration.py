@@ -149,6 +149,39 @@ def test_duplicate_run_after_success_does_not_resubmit(monkeypatch):
     refund.assert_not_called()             # and definitely no refund fired
 
 
+def test_submit_translates_quality_and_size_before_sending_to_fal(monkeypatch):
+    """The params dict actually sent to fal.ai must carry the translated
+    values (low/medium/high, image_size preset) -- job.input_params (read
+    back via GET /jobs and /batches) must keep the original user-facing
+    values untouched."""
+    job = MagicMock(
+        id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+        feature_type="test_tool",  # no TOOL_HANDLERS entry -- isolates the translation step itself
+        credits_charged=5, credits_from_subscription=3, credits_from_topup=2,
+        input_params={"color": "red", "quality": "premium", "size": "9:16"},
+    )
+    original_input_params = dict(job.input_params)
+    tool = _tool()
+    db = _worker_db(job, tool)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    submit = MagicMock(return_value="fal-req-1")
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    assert job.status == "processing"
+    sent_params = submit.call_args.args[1]
+    assert sent_params["quality"] == "high"          # premium -> high
+    assert sent_params["image_size"] == "portrait_16_9"  # 9:16 -> portrait_16_9
+    assert "size" not in sent_params
+
+    # job.input_params itself is never touched
+    assert job.input_params == original_input_params
+
+
 def test_duplicate_run_after_failure_does_not_double_refund(monkeypatch):
     job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
                      feature_type="test_tool", credits_charged=5,
