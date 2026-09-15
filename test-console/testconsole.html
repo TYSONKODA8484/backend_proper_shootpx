@@ -115,6 +115,18 @@
 
 <div id="gen-result" style="margin-top:12px;"></div>
 
+<h2>7b. Enhance Prompt (quick test)</h2>
+<div style="color:#777;font-size:13px;margin-bottom:4px;">
+  Type a plain prompt, click enhance, get the AI-rewritten text back -- no
+  image upload needed. Uses the same team_id as section 7 above.
+</div>
+<div>
+  <input id="enhance-prompt-input" placeholder="prompt to enhance" size="50" />
+  <input id="enhance-source-tool" placeholder="source_feature_type" size="16" value="recolor" />
+  <button id="enhance-prompt-btn">Enhance</button>
+</div>
+<div id="enhance-result" style="margin-top:10px;"></div>
+
 <div style="margin-top:10px;">
   <input id="lookup-job-id" placeholder="jobId" size="38" />
   <button id="lookup-job-btn">GET /jobs/{id}</button>
@@ -534,6 +546,51 @@
     if (status !== 200 || !data?.batchId) return;
 
     startPollingBatch(data.batchId);
+  };
+
+  // --- Enhance Prompt: quick text-in / text-out test, no images ---------
+  $("enhance-prompt-btn").onclick = async () => {
+    const box = $("enhance-result");
+    const teamId = $("gen-team-id").value.trim();
+    const prompt = $("enhance-prompt-input").value.trim();
+    const sourceFeatureType = $("enhance-source-tool").value.trim();
+
+    if (!teamId) return (box.textContent = "enter a team_id in section 7 above first");
+    if (!prompt) return (box.textContent = "enter a prompt to enhance");
+
+    box.textContent = "enhancing...";
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", "enhance_prompt");
+    formData.append("prompt", prompt);
+    formData.append("source_feature_type", sourceFeatureType || "recolor");
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.jobs?.[0]?.jobId) {
+      box.textContent = "failed to start -- see log below";
+      return;
+    }
+
+    const jobId = data.jobs[0].jobId;
+    const start = Date.now();
+    const poll = async () => {
+      const { status: s, data: d } = await call("GET", `/jobs/${jobId}`, { auth: true });
+      if (s !== 200) { box.textContent = "lookup failed -- see log"; return; }
+
+      if (d.status === "completed") {
+        box.innerHTML = `<b>Enhanced:</b><br><pre style="white-space:pre-wrap;">${d.outputText || "(empty)"}</pre>`;
+        return;
+      }
+      if (d.status === "failed") {
+        box.innerHTML = `<span style="color:#b91c1c">Failed: ${d.errorMessage || "unknown error"}</span>`;
+        return;
+      }
+      if (Date.now() - start > 30000) { box.textContent = `still ${d.status} after 30s -- giving up polling`; return; }
+      box.textContent = `${d.status}... (polling)`;
+      setTimeout(poll, 1500);
+    };
+    poll();
   };
 
   $("lookup-job-btn").onclick = () => {

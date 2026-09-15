@@ -6,7 +6,7 @@ from app.core.fal_client import call_fal_sync
 logger = logging.getLogger(__name__)
 
 
-def build_instruction(job, tool_definition) -> str:
+def build_instruction(job, tool_definition, db) -> str:
     """
     Returns the final instruction string to send to the real recolor model.
     Two paths, per Recolor's PRD:

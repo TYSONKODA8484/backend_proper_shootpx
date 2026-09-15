@@ -207,10 +207,37 @@ def handle_fal_webhook(db: Session, job_id, payload: dict):
             _deliver_late_success_after_timeout(db, job, payload)
         return
 
+    # if payload.get("status") == "OK":
+    #     images = payload.get("payload", {}).get("images", [])
+    #     fal_url = images[0]["url"] if images else None
     if payload.get("status") == "OK":
+        if job.feature_type == "enhance_prompt":
+            output_text = payload.get("payload", {}).get("output")
+            if output_text:
+                job.output_text = output_text
+                job.status = "completed"
+            else:
+                job.status = "failed"
+                job.error_message = "fal reported success but returned no text"
+                refund_credits(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
+            job.completed_at = datetime.now(timezone.utc)
+            job.duration_seconds = int((job.completed_at - job.created_at).total_seconds())
+
+            remaining = db.query(GenerationJob).filter(
+                GenerationJob.batch_id == job.batch_id,
+                GenerationJob.status.in_(("queued", "processing")),
+            ).count()
+
+            if remaining <= 1:
+                release_generation_lock(job.user_id)
+                release_fal_slot(job.team_id)
+
+            db.commit()
+            return
+
         images = payload.get("payload", {}).get("images", [])
         fal_url = images[0]["url"] if images else None
-
+        
         if fal_url:
             try:
                 file_bytes = download_from_url(fal_url)

@@ -60,7 +60,10 @@ FAL_SIZE_TRANSLATION = {
 # `prompt` string -- they are not part of gpt-image-2/edit's real input
 # schema (prompt, image_urls, image_size, background, quality, num_images,
 # output_format, sync_mode, mask_url) and must not be forwarded raw.
-FAL_NON_SCHEMA_FIELDS = {"color", "target_area"}
+# "source_feature_type" is enhance_prompt's own UI/schema field, already
+# consumed by build_instruction() to look up the source tool's enhance_hint
+# -- not part of openrouter/router's real input schema, must not be forwarded.
+FAL_NON_SCHEMA_FIELDS = {"color", "target_area", "source_feature_type"}
 
 
 def _translate_fal_params(params: dict) -> dict:
@@ -259,8 +262,16 @@ async def submit_generation_to_fal(ctx, job_id: str, attempt: int = 1):
                 # "queued" instead of cleanly failed -- the loop wasn't free
                 # to run the except block/cleanup below, let alone arq's own
                 # shutdown handler.
-                instruction = await asyncio.to_thread(build_instruction, job, tool)
+                instruction = await asyncio.to_thread(build_instruction, job, tool, db)
                 params = {**job.input_params, "prompt": instruction}
+                # The tool's own ai_steps can name which underlying model the
+                # fal endpoint itself should route to (e.g. enhance_prompt's
+                # tool_definitions row: ai_steps={"model": "google/gemini-2.5-flash"}
+                # for openrouter/router) -- distinct from ai_steps sub-keys
+                # like recolor's detect_target, which build_instruction()
+                # already fully consumes itself and never surfaces here.
+                if tool.ai_steps.get("model"):
+                    params["model"] = tool.ai_steps["model"]
             else:
                 params = job.input_params
 

@@ -50,8 +50,10 @@ async def generate(
     quality: str = Form(None),
     size: str = Form(None),
     target_area: str = Form(None),
+    prompt: str = Form(None),
+    source_feature_type: str = Form(None),
     output_count: int = Form(1),
-    images: List[UploadFile] = File(...),
+    images: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -82,7 +84,10 @@ async def generate(
     try:
         validate_input_params(
             tool_check.param_schema,
-            {"color": color, "quality": quality, "size": size, "target_area": target_area},
+            {
+                "color": color, "quality": quality, "size": size, "target_area": target_area,
+                "prompt": prompt, "source_feature_type": source_feature_type,
+            },
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -116,6 +121,8 @@ async def generate(
         "quality": quality,
         "size": size,
         "target_area": target_area,
+        "prompt": prompt,
+        "source_feature_type": source_feature_type,
         "image_urls": image_urls,  # always a list now, even for single-image tools
     }
     input_params = {k: v for k, v in input_params.items() if v is not None}
@@ -157,6 +164,7 @@ def get_job(
         "jobId": str(job.id),
         "status": job.status,
         "outputUrl": job.output_url,
+        "outputText": job.output_text,
         "errorMessage": job.error_message,
         "creditsCharged": job.credits_charged,
     }
@@ -180,7 +188,10 @@ def get_batch(
     return {
         "batchId": str(batch_id),
         "jobs": [
-            {"jobId": str(j.id), "status": j.status, "outputUrl": j.output_url, "errorMessage": j.error_message}
+            {
+                "jobId": str(j.id), "status": j.status, "outputUrl": j.output_url,
+                "outputText": j.output_text, "errorMessage": j.error_message,
+            }
             for j in jobs
         ],
     }

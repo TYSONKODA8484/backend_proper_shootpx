@@ -207,7 +207,7 @@ def test_submit_calls_the_tools_build_instruction_via_a_thread_and_uses_its_resu
 
     _run(worker.submit_generation_to_fal({}, str(job.id)))
 
-    build_instruction.assert_called_once_with(job, tool)
+    build_instruction.assert_called_once_with(job, tool, db)
     assert job.status == "processing"
     sent_params = submit.call_args.args[1]
     assert sent_params["prompt"] == "Recolor the detected jacket to color red"

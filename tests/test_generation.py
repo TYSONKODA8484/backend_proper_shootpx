@@ -447,8 +447,59 @@ def test_webhook_success_completes_job_and_releases_lock(monkeypatch):
     assert job.status == "completed"
     assert job.output_url == "https://our-storage.test/permanent/out.png"
     assert released == [job.user_id]
+
+
+# --------------------------------------------------------------------------- #
+# enhance_prompt webhook branch -- text output, not an image download/upload
+# --------------------------------------------------------------------------- #
+
+def test_webhook_success_sets_output_text_for_enhance_prompt_without_touching_output_url(monkeypatch):
+    job = _job()
+    job.feature_type = "enhance_prompt"
+    job.output_text = None
+    db = _webhook_db(job)
+    released = []
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: released.append(uid))
+    download = MagicMock()
+    upload = MagicMock()
+    monkeypatch.setattr(generation_svc, "download_from_url", download)
+    monkeypatch.setattr(generation_svc, "upload_to_storage", upload)
+    refund = MagicMock()
+    monkeypatch.setattr(generation_svc, "refund_credits", refund)
+
+    generation_svc.handle_fal_webhook(
+        db, uuid.uuid4(),
+        {"status": "OK", "payload": {"output": "A vivid, richly detailed enhanced prompt."}},
+    )
+
+    assert job.status == "completed"
+    assert job.output_text == "A vivid, richly detailed enhanced prompt."
+    assert job.output_url is None
+    download.assert_not_called()
+    upload.assert_not_called()
     refund.assert_not_called()
+    assert released == [job.user_id]
     db.commit.assert_called_once()
+
+
+def test_webhook_success_with_no_text_fails_and_refunds_enhance_prompt(monkeypatch):
+    job = _job()
+    job.feature_type = "enhance_prompt"
+    job.output_text = None
+    db = _webhook_db(job)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    refund = MagicMock()
+    monkeypatch.setattr(generation_svc, "refund_credits", refund)
+
+    generation_svc.handle_fal_webhook(
+        db, uuid.uuid4(),
+        {"status": "OK", "payload": {}},
+    )
+
+    assert job.status == "failed"
+    assert job.output_text is None
+    assert job.error_message == "fal reported success but returned no text"
+    refund.assert_called_once_with(db, job.team_id, job.credits_charged, job.credits_from_subscription, job.credits_from_topup)
 
 
 def test_webhook_failure_sets_failed_and_refunds_matching_split(monkeypatch):
@@ -835,6 +886,73 @@ def test_generate_uploads_every_image_and_passes_all_urls_through(gen_client, mo
     assert upload.call_count == 2
     # image_urls is ALWAYS a list, in upload order, one URL per uploaded file
     assert captured["input_params"]["image_urls"] == ["https://fal.test/1.png", "https://fal.test/2.png"]
+
+
+def test_generate_accepts_enhance_prompt_with_no_images(gen_client, monkeypatch):
+    """enhance_prompt has max_input_images=0 and needs "prompt" +
+    "source_feature_type" instead of any of Recolor's fields -- confirms the
+    route actually accepts both, requires no file upload, and forwards them
+    through to create_generation_batch untouched."""
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        max_input_images=0,
+        param_schema=[
+            {"name": "prompt", "type": "text", "label": "Prompt", "required": True},
+            {"name": "source_feature_type", "type": "text", "label": "Source tool", "required": True},
+        ],
+    )
+    upload = MagicMock()
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+
+    captured = {}
+
+    def fake_create_batch(db_, team_id, user_id, feature_type, input_params, output_count):
+        captured["input_params"] = input_params
+        return [MagicMock(id=uuid.uuid4(), batch_id=uuid.uuid4(), status="queued")]
+    monkeypatch.setattr("app.routes.generation.create_generation_batch", fake_create_batch)
+
+    async def fake_get_arq_pool():
+        pool = MagicMock()
+
+        async def enqueue_job(*a, **k):
+            return None
+        pool.enqueue_job = enqueue_job
+        return pool
+    monkeypatch.setattr("app.routes.generation.get_arq_pool", fake_get_arq_pool)
+
+    res = client.post(
+        "/generate",
+        data={
+            "team_id": str(TEAM_ID), "feature_type": "enhance_prompt",
+            "prompt": "a cool sneaker", "source_feature_type": "recolor",
+        },
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 200
+    upload.assert_not_called()  # no images -- must never try to upload anything
+    assert captured["input_params"]["prompt"] == "a cool sneaker"
+    assert captured["input_params"]["source_feature_type"] == "recolor"
+    assert captured["input_params"]["image_urls"] == []
+
+
+def test_get_job_returns_output_text_for_enhance_prompt(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    job = MagicMock(
+        id=uuid.uuid4(), team_id=TEAM_ID, status="completed",
+        output_url=None, output_text="an enhanced, more vivid prompt",
+        error_message=None, credits_charged=0,
+    )
+    db.query.return_value.filter.return_value.first.return_value = job
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+
+    res = client.get(f"/jobs/{job.id}", headers={"Authorization": "Bearer x"})
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["outputText"] == "an enhanced, more vivid prompt"
+    assert body["outputUrl"] is None
 
 
 def test_get_job_rejects_non_team_member(gen_client, monkeypatch):
