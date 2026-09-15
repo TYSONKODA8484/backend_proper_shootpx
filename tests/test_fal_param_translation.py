@@ -144,3 +144,106 @@ def test_full_recolor_payload_translates_cleanly():
         "image_urls": ["https://fal.test/1.png"],
         "prompt": "Recolor the sneaker sole to color red",
     }
+
+
+# --------------------------------------------------------------------------- #
+# creative_photoshoot: its own "4:5" size option, "idea" stripped like
+# color/target_area, and "quality" is a real 1K/2K/4K resolution tier
+# translated to fal's actual quality enum + a default image_size.
+# --------------------------------------------------------------------------- #
+
+def test_creative_photoshoots_4_5_size_option_translates_to_a_genuinely_valid_fal_image_size():
+    result = worker._translate_fal_params({"size": "4:5"})
+    assert _is_valid_fal_image_size(result["image_size"]), (
+        f"size='4:5' translated to {result['image_size']!r}, "
+        f"which is not a value fal's image_size parameter actually accepts"
+    )
+
+
+def test_idea_is_stripped_not_forwarded_to_fal():
+    """"idea" is creative_photoshoot's own UI/schema field, already consumed
+    by build_instruction() into the `prompt` string -- gpt-image-2/edit's real
+    schema has no such field."""
+    result = worker._translate_fal_params({"idea": "Sci-Fi", "quality": "medium"})
+    assert "idea" not in result
+    assert result["quality"] == "medium"
+
+
+@pytest.mark.parametrize("tier,expected_quality", [("1k", "medium"), ("2k", "high"), ("4k", "high")])
+def test_creative_photoshoots_quality_tier_translates_to_a_real_fal_quality_value(tier, expected_quality):
+    result = worker._translate_fal_params({"quality": tier})
+    assert result["quality"] == expected_quality
+
+
+@pytest.mark.parametrize("tier", ["1k", "2k", "4k"])
+def test_creative_photoshoots_quality_tier_default_image_size_is_genuinely_valid(tier):
+    """When no explicit aspect-ratio "size" is chosen, the quality tier's own
+    resolution becomes the default image_size."""
+    result = worker._translate_fal_params({"quality": tier})
+    assert _is_valid_fal_image_size(result["image_size"]), (
+        f"quality={tier!r} defaulted to image_size={result['image_size']!r}, "
+        f"which is not a value fal's image_size parameter actually accepts"
+    )
+
+
+def test_explicit_aspect_ratio_size_wins_over_the_quality_tiers_default_resolution():
+    """An explicit aspect-ratio choice ("9:16") controls dimensions; the
+    quality tier still sets the real fal `quality` value, but does not
+    override the size the user actually picked."""
+    result = worker._translate_fal_params({"quality": "4k", "size": "9:16"})
+    assert result["quality"] == "high"
+    assert result["image_size"] == worker.FAL_SIZE_TRANSLATION["9:16"]
+
+
+def test_quality_tier_still_supplies_its_default_resolution_when_size_is_original():
+    result = worker._translate_fal_params({"quality": "2k", "size": "original"})
+    assert result["quality"] == "high"
+    assert result["image_size"] == worker.CREATIVE_QUALITY_TIERS["2k"]["image_size"]
+
+
+def test_recolors_own_quality_values_are_unaffected_by_the_new_tier_table():
+    """auto/low/medium/high (recolor's real schema values) must never match a
+    key in CREATIVE_QUALITY_TIERS and must keep passing through unchanged."""
+    for value in ("auto", "low", "medium", "high"):
+        result = worker._translate_fal_params({"quality": value})
+        assert result["quality"] == value
+        assert "image_size" not in result  # no size given, no tier matched -- nothing to default
+
+
+# --------------------------------------------------------------------------- #
+# listing_photoshoot: "quality" (standard/high) translates to real, DISTINCT
+# fal values -- selecting "high" must actually differ from "standard".
+#
+# Found live: this used to unconditionally force BOTH options to "medium"
+# (the old FAL_HARDCODED_PARAMS blanket override) -- picking "high" quality
+# silently did nothing at all. _translate_fal_params now needs feature_type
+# explicitly passed for this to apply, since "quality":"high" is also
+# recolor's own real, valid value and must not be touched for that tool.
+# --------------------------------------------------------------------------- #
+
+def test_listing_photoshoots_standard_quality_translates_to_medium():
+    result = worker._translate_fal_params({"quality": "standard"}, feature_type="listing_photoshoot")
+    assert result["quality"] == "medium"
+
+
+def test_listing_photoshoots_high_quality_actually_differs_from_standard():
+    """The real regression this fixes: "high" must not collapse to the same
+    value as "standard" any more."""
+    result = worker._translate_fal_params({"quality": "high"}, feature_type="listing_photoshoot")
+    assert result["quality"] == "high"
+
+
+def test_listing_photoshoots_quality_translation_only_applies_when_feature_type_matches():
+    """Without feature_type="listing_photoshoot" (e.g. the default worker.py
+    call for every other tool), "standard"/"high" must pass through
+    untouched -- this translation must never apply globally."""
+    result = worker._translate_fal_params({"quality": "standard"})
+    assert result["quality"] == "standard"  # untouched -- no feature_type given
+
+
+def test_listing_photoshoots_translation_does_not_leak_into_recolors_real_high_value():
+    """recolor's own real "high" value must be completely unaffected even
+    though it's spelled identically to listing_photoshoot's "high" option --
+    proven by passing recolor's feature_type explicitly."""
+    result = worker._translate_fal_params({"quality": "high"}, feature_type="recolor")
+    assert result["quality"] == "high"  # unaffected -- LISTING_QUALITY_TRANSLATION never applies to recolor

@@ -13,11 +13,12 @@ from app.core.cache import redis_client
 from app.core.database import SessionLocal
 from app.core.fal_client import submit_to_fal, check_fal_status, fetch_fal_result
 from app.core.arq_pool import get_arq_pool
+import app.models  # noqa: F401 -- registers every model on Base.metadata before any query runs (see app/models/__init__.py)
 from app.models.team_subscription import TeamSubscription
 from app.models.subscription import Subscription
 from app.models.team import Team
 from app.models.generation_job import GenerationJob
-from app.models.tool_definition import ToolDefinition
+from app.services.tool_definitions import get_tool_definition
 from app.services.credits import refill_subscription_credits, refund_credits
 from app.services.generation_lock import (
     release_generation_lock, try_reserve_fal_slot, release_fal_slot, INFLIGHT_KEY_GLOBAL,
@@ -53,6 +54,9 @@ FAL_SIZE_TRANSLATION = {
     "16:9": "landscape_16_9",
     "2:3": {"width": 1024, "height": 1536},
     "3:2": {"width": 1536, "height": 1024},
+    # creative_photoshoot's own size option, same constraints as above --
+    # 1024x1280 is an exact 4:5 ratio, both dimensions multiples of 16.
+    "4:5": {"width": 1024, "height": 1280},
 }
 
 # "color" and "target_area" are Recolor's own UI/schema fields, already
@@ -63,10 +67,48 @@ FAL_SIZE_TRANSLATION = {
 # "source_feature_type" is enhance_prompt's own UI/schema field, already
 # consumed by build_instruction() to look up the source tool's enhance_hint
 # -- not part of openrouter/router's real input schema, must not be forwarded.
-FAL_NON_SCHEMA_FIELDS = {"color", "target_area", "source_feature_type"}
+# "idea" is creative_photoshoot's own UI/schema field, already consumed by
+# build_instruction() to build the scene prompt -- not part of
+# gpt-image-2/edit's real input schema, must not be forwarded raw.
+# "shot_type" is listing_photoshoot's own per-job planning metadata (written
+# by plan_listing_shots() into each job's input_params via per_job_overrides,
+# before the job ever exists -- there is no build_instruction step for this
+# tool) -- not part of gpt-image-2/edit's real input schema either.
+FAL_NON_SCHEMA_FIELDS = {"color", "target_area", "source_feature_type", "idea", "shot_type"}
+
+# listing_photoshoot's own "quality" schema field (options: "standard"/
+# "high") uses UI labels, not fal's real quality enum (auto/low/medium/
+# high) -- "standard" is not a valid fal value at all, and while "high"
+# HAPPENS to already be spelled the same as a real fal value, that's not
+# guaranteed to stay true and must still be translated explicitly, not
+# assumed. Kept feature-scoped, not merged into a shared quality-VALUE
+# lookup (see CREATIVE_QUALITY_TIERS below) because "high" is ALSO one of
+# recolor's own real, valid quality values -- a shared table would corrupt
+# a real recolor "high" selection into whatever this tool maps "high" to.
+#
+# Found live: this used to force BOTH "standard" and "high" to "medium"
+# unconditionally (FAL_HARDCODED_PARAMS) -- selecting "high" quality for
+# listing_photoshoot had silently done nothing at all.
+LISTING_QUALITY_TRANSLATION = {
+    "standard": "medium",
+    "high": "high",
+}
+
+# creative_photoshoot's own "quality" schema field is a resolution tier
+# (1K/2K/4K), not one of gpt-image-2/edit's real quality values (auto/low/
+# medium/high) -- unlike recolor, where the schema's quality values already
+# ARE fal's real values directly. Each tier maps to BOTH the real fal
+# `quality` value and its own target resolution -- 2048x2048 and 3840x2160
+# both satisfy fal's image_size constraints (multiples of 16, max edge
+# 3840px, ratio <= 3:1, total pixels 655,360-8,294,400).
+CREATIVE_QUALITY_TIERS = {
+    "1k": {"quality": "medium", "image_size": "square_hd"},
+    "2k": {"quality": "high", "image_size": {"width": 2048, "height": 2048}},
+    "4k": {"quality": "high", "image_size": {"width": 3840, "height": 2160}},
+}
 
 
-def _translate_fal_params(params: dict) -> dict:
+def _translate_fal_params(params: dict, feature_type: str | None = None) -> dict:
     """
     Applied only to the payload actually sent to fal.ai -- the caller's own
     dict (job.input_params) is never mutated, so the user-facing size value
@@ -75,9 +117,22 @@ def _translate_fal_params(params: dict) -> dict:
     """
     translated = dict(params)
 
-    if "size" in translated:
-        size = translated.pop("size")
-        translated["image_size"] = FAL_SIZE_TRANSLATION.get(size, size)
+    size_value = translated.pop("size", None)
+    if size_value is not None:
+        translated["image_size"] = FAL_SIZE_TRANSLATION.get(size_value, size_value)
+
+    # creative_photoshoot's quality tier always sets the real fal `quality`
+    # value; it only supplies image_size when no explicit aspect-ratio size
+    # was chosen above (an explicit "size" selection wins for dimensions --
+    # the tier's own resolution is just its sensible default).
+    tier = CREATIVE_QUALITY_TIERS.get(translated.get("quality"))
+    if tier:
+        translated["quality"] = tier["quality"]
+        if size_value is None or size_value == "original":
+            translated["image_size"] = tier["image_size"]
+
+    if feature_type == "listing_photoshoot" and "quality" in translated:
+        translated["quality"] = LISTING_QUALITY_TRANSLATION.get(translated["quality"], translated["quality"])
 
     for field in FAL_NON_SCHEMA_FIELDS:
         translated.pop(field, None)
@@ -195,9 +250,7 @@ async def submit_generation_to_fal(ctx, job_id: str, attempt: int = 1):
         if not job or job.status != "queued":
             return
 
-        tool = db.query(ToolDefinition).filter(
-            ToolDefinition.feature_type == job.feature_type
-        ).first()
+        tool = get_tool_definition(db, job.feature_type)
         if not tool:
             return
 
@@ -270,12 +323,23 @@ async def submit_generation_to_fal(ctx, job_id: str, attempt: int = 1):
                 # for openrouter/router) -- distinct from ai_steps sub-keys
                 # like recolor's detect_target, which build_instruction()
                 # already fully consumes itself and never surfaces here.
-                if tool.ai_steps.get("model"):
+                #
+                # Deliberately scoped to enhance_prompt only -- unlike
+                # openrouter/router, gpt-image-2/edit (recolor's and
+                # creative_photoshoot's real fal model) has NO "model" field
+                # in its schema at all. tool.ai_steps is a raw JSONB column
+                # hand-edited via SQL with no schema enforcement; a top-level
+                # "model" key added to recolor's or creative_photoshoot's row
+                # by mistake (easy to do since nested steps like
+                # detect_target/scene_vision already use "model" as a
+                # sub-key) would otherwise silently inject an invalid field
+                # into every real image generation call for that tool.
+                if job.feature_type == "enhance_prompt" and tool.ai_steps.get("model"):
                     params["model"] = tool.ai_steps["model"]
             else:
                 params = job.input_params
 
-            params = _translate_fal_params(params)
+            params = _translate_fal_params(params, job.feature_type)
 
             # Same reasoning -- submit_to_fal() is also a blocking httpx call.
             fal_request_id = await asyncio.to_thread(submit_to_fal, tool.fal_model_id, params, webhook_url)
@@ -338,18 +402,31 @@ def _fail_stale_job(db, job_id, message: str) -> bool:
 
 async def check_generation_timeouts(ctx):
     """
-    Per-tool timeout enforcement: runs far more often than the 10-minute
-    catch-all sweep below, and times each "processing" job out against its
-    own tool's generation_timeout_seconds instead of one fixed cutoff for
-    every tool. Only targets "processing" jobs -- a job still "queued" hasn't
-    been submitted to fal yet, so there's no tool-specific budget to measure
-    it against; the 10-minute sweep's flat cutoff still catches a job stuck
-    in that earlier state.
+    Two jobs in one pass over every "processing" job, both driven by fal's own
+    real queue status:
 
-    Before actually failing a job for running past its budget, this confirms
-    against fal's own real queue status first -- our local timeout elapsing
-    doesn't mean fal's work did too, and blindly failing+refunding a job fal
-    is about to (or already did) deliver for free is a real money-loss bug.
+    1. DELIVERY: as soon as fal reports COMPLETED, the result is fetched and
+       applied immediately -- regardless of how much of the tool's budget is
+       left. This is what actually resolves jobs whenever the fal webhook
+       never arrives, which is ALWAYS the case in local dev: fal's cloud
+       cannot reach a PUBLIC_BACKEND_URL of 127.0.0.1, so the webhook is
+       never delivered and this poll is the only path that finishes a job.
+       This check used to sit behind the budget gate below, which meant a job
+       fal had finished in 40s still sat "processing" until its full budget
+       elapsed (60s for recolor -- looked fine; 180s for creative_photoshoot
+       -- looked broken). In production it's also a genuine safety net for a
+       webhook that's lost or arrives late.
+
+    2. TIMEOUT: only once a job is past its own tool's generation_timeout_seconds
+       AND fal has not reported it COMPLETED is it failed + refunded. Checking
+       fal first matters: our budget elapsing doesn't mean fal's work did too,
+       and blindly failing+refunding a job fal already delivered is a real
+       money-loss bug.
+
+    Only targets "processing" jobs -- a job still "queued" hasn't been
+    submitted to fal yet, so there's nothing to poll and no tool-specific
+    budget to measure it against; the 10-minute sweep's flat cutoff still
+    catches a job stuck in that earlier state.
     """
     db = SessionLocal()
     now = datetime.now(timezone.utc)
@@ -363,16 +440,13 @@ async def check_generation_timeouts(ctx):
     for job in processing:
         try:
             if job.feature_type not in tools_by_feature_type:
-                tools_by_feature_type[job.feature_type] = db.query(ToolDefinition).filter(
-                    ToolDefinition.feature_type == job.feature_type
-                ).first()
+                tools_by_feature_type[job.feature_type] = get_tool_definition(db, job.feature_type)
 
             tool = tools_by_feature_type[job.feature_type]
             if not tool:
                 continue  # unknown tool -- the 10-minute sweep will still catch it
 
-            if job.created_at > now - timedelta(seconds=tool.generation_timeout_seconds):
-                continue  # still within its own tool's budget
+            past_budget = job.created_at <= now - timedelta(seconds=tool.generation_timeout_seconds)
 
             # check_fal_status / fetch_fal_result / handle_fal_webhook (which
             # itself downloads + uploads the output) are all blocking,
@@ -394,20 +468,24 @@ async def check_generation_timeouts(ctx):
                     )
 
             if fal_status == "COMPLETED":
-                # fal actually finished (successfully or not) before we got to
-                # it -- resolve with the real result via the exact same path a
-                # real webhook delivery would use, instead of failing a job
-                # that may well have already succeeded.
+                # fal has finished (successfully or not) -- deliver the real
+                # result now, through the exact same path a real webhook
+                # delivery would use. Deliberately NOT gated on the budget:
+                # this is what finishes jobs at all whenever the webhook never
+                # arrives (always, in local dev).
                 result_payload = await asyncio.to_thread(
                     fetch_fal_result, tool.fal_model_id, job.fal_request_id,
                 )
                 logger.info(
-                    "job %s locally timed out but fal had already COMPLETED it -- "
-                    "resolving with the real result instead of failing",
-                    job.id,
+                    "job %s: fal reports COMPLETED -- delivering the real result "
+                    "(past_budget=%s)",
+                    job.id, past_budget,
                 )
                 await asyncio.to_thread(generation_svc.handle_fal_webhook, db, job.id, result_payload)
                 continue
+
+            if not past_budget:
+                continue  # still within its own tool's budget -- let it keep running
 
             if fal_status in ("IN_QUEUE", "IN_PROGRESS"):
                 # Measuring this specifically: how often our timeout fires

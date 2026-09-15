@@ -8,8 +8,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core.database import get_db
 from app.core.cache import get_cached, set_cached
 from app.models.tool import Tool
-from app.models.tool_definition import ToolDefinition
 from app.schemas.tools import ToolsResponse, ToolOut
+from app.services.tool_definitions import get_tool_definition
 from app.core.limiter import limiter
 from app.deps import get_current_user
 from app.models.user import User
@@ -55,12 +55,9 @@ def get_tool_schema(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    tool = db.query(ToolDefinition).filter(
-        ToolDefinition.feature_type == feature_type,
-        ToolDefinition.stage == 1,
-    ).first()
+    tool = get_tool_definition(db, feature_type)
 
-    if not tool or not tool.is_active:
+    if not tool or tool.stage != 1 or not tool.is_active:
         raise HTTPException(status_code=404, detail="Tool not found")
 
     # Deliberately return ONLY these two fields — fal_model_id and ai_steps

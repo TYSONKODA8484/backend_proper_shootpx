@@ -127,6 +127,98 @@
 </div>
 <div id="enhance-result" style="margin-top:10px;"></div>
 
+<h2>7c. Creative Photoshoot (quick test)</h2>
+<div style="color:#777;font-size:13px;margin-bottom:4px;">
+  Upload up to 5 product images, pick an idea and/or type your own prompt,
+  click Generate, get the image back. Uses the same team_id as section 7 above.
+</div>
+<div>
+  <label>Idea:
+    <select id="creative-idea">
+      <option value="">(none)</option>
+      <option value="Lifestyle / in-use scene">Lifestyle / in-use scene</option>
+      <option value="Sci-Fi">Sci-Fi</option>
+      <option value="Luxury">Luxury</option>
+    </select>
+  </label>
+  <input id="creative-prompt" placeholder="prompt (optional, or required if no idea)" size="34" />
+</div>
+<div style="margin-top:8px;">
+  <label>Quality:
+    <select id="creative-quality">
+      <option value="">(none)</option>
+      <option value="1k">1K</option>
+      <option value="2k">2K</option>
+      <option value="4k">4K</option>
+    </select>
+  </label>
+  <span style="color:#777;font-size:12px;">sets fal's real quality value AND the default resolution</span>
+</div>
+<div style="margin-top:8px;">
+  <label>Size (aspect ratio):
+    <select id="creative-size">
+      <option value="">(none / auto)</option>
+      <option value="original">original</option>
+      <option value="1:1">1:1</option>
+      <option value="4:5">4:5</option>
+      <option value="9:16">9:16</option>
+      <option value="16:9">16:9</option>
+    </select>
+  </label>
+  <span style="color:#777;font-size:12px;">overrides the quality tier's default resolution, if set</span>
+</div>
+<div style="margin-top:8px;">
+  <label>Image(s): <input id="creative-images" type="file" accept="image/*" multiple /></label>
+  <span style="color:#777;font-size:12px;">up to 5</span>
+</div>
+<div style="margin-top:8px;">
+  <button id="creative-photoshoot-btn">Generate</button>
+</div>
+<div id="creative-result" style="margin-top:10px;"></div>
+
+<h2>7d. Listing Photoshoot (quick test)</h2>
+<div style="color:#777;font-size:13px;margin-bottom:4px;">
+  Upload up to 5 product images, optionally steer it with a prompt, click
+  Generate. Plans N distinct shots (hero/side/wearing/sole, etc.) up front,
+  then creates one job per shot -- this is a BATCH, so results render in the
+  "7. Generation" result area above (reuses the same batch poller). Uses the
+  same team_id as section 7.
+</div>
+<div>
+  <input id="listing-prompt" placeholder="prompt (optional -- steers shot planning)" size="40" />
+</div>
+<div style="margin-top:8px;">
+  <label>Quality:
+    <select id="listing-quality">
+      <option value="">(none)</option>
+      <option value="standard">standard</option>
+      <option value="high">high</option>
+    </select>
+  </label>
+  <label style="margin-left:12px;">Size:
+    <select id="listing-size">
+      <option value="">(none / auto)</option>
+      <option value="original">original</option>
+      <option value="1:1">1:1</option>
+      <option value="4:5">4:5</option>
+      <option value="9:16">9:16</option>
+      <option value="16:9">16:9</option>
+    </select>
+  </label>
+</div>
+<div style="margin-top:8px;">
+  <label>Number of shots: <input id="listing-output-count" type="number" min="1" max="20" placeholder="tool default (4)" size="4" /></label>
+  <span style="color:#777;font-size:12px;">leave blank to use the tool's own default</span>
+</div>
+<div style="margin-top:8px;">
+  <label>Image(s): <input id="listing-images" type="file" accept="image/*" multiple /></label>
+  <span style="color:#777;font-size:12px;">up to 5</span>
+</div>
+<div style="margin-top:8px;">
+  <button id="listing-photoshoot-btn">Generate</button>
+</div>
+<div id="listing-result" style="margin-top:10px;color:#777;font-size:13px;"></div>
+
 <div style="margin-top:10px;">
   <input id="lookup-job-id" placeholder="jobId" size="38" />
   <button id="lookup-job-btn">GET /jobs/{id}</button>
@@ -591,6 +683,101 @@
       setTimeout(poll, 1500);
     };
     poll();
+  };
+
+  // --- Creative Photoshoot: quick image-in / image-out test ---------------
+  $("creative-photoshoot-btn").onclick = async () => {
+    const box = $("creative-result");
+    const teamId = $("gen-team-id").value.trim();
+    const idea = $("creative-idea").value;
+    const prompt = $("creative-prompt").value.trim();
+    const quality = $("creative-quality").value;
+    const size = $("creative-size").value;
+    const images = $("creative-images").files;
+
+    if (!teamId) return (box.textContent = "enter a team_id in section 7 above first");
+    if (!idea && !prompt) return (box.textContent = "pick an idea or type a prompt (at least one is required)");
+    if (!images || images.length === 0) return (box.textContent = "select at least one product image");
+
+    box.textContent = "generating...";
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", "creative_photoshoot");
+    if (idea) formData.append("idea", idea);
+    if (prompt) formData.append("prompt", prompt);
+    if (quality) formData.append("quality", quality);
+    if (size) formData.append("size", size);
+    for (const file of images) formData.append("images", file);
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.jobs?.[0]?.jobId) {
+      box.textContent = "failed to start -- see log below";
+      return;
+    }
+
+    const jobId = data.jobs[0].jobId;
+    const start = Date.now();
+    const poll = async () => {
+      const { status: s, data: d } = await call("GET", `/jobs/${jobId}`, { auth: true });
+      if (s !== 200) { box.textContent = "lookup failed -- see log"; return; }
+
+      if (d.status === "completed") {
+        box.innerHTML = "";
+        if (d.outputUrl) {
+          const img = document.createElement("img");
+          img.src = d.outputUrl;
+          img.style.maxWidth = "300px";
+          img.style.display = "block";
+          box.appendChild(img);
+        } else {
+          box.textContent = "completed with no outputUrl (unexpected)";
+        }
+        return;
+      }
+      if (d.status === "failed") {
+        box.innerHTML = `<span style="color:#b91c1c">Failed: ${d.errorMessage || "unknown error"}</span>`;
+        return;
+      }
+      if (Date.now() - start > 240000) { box.textContent = `still ${d.status} after 240s -- giving up polling`; return; }
+      box.textContent = `${d.status}... (polling)`;
+      setTimeout(poll, 2000);
+    };
+    poll();
+  };
+
+  // --- Listing Photoshoot: quick multi-shot batch test --------------------
+  $("listing-photoshoot-btn").onclick = async () => {
+    const box = $("listing-result");
+    const teamId = $("gen-team-id").value.trim();
+    const prompt = $("listing-prompt").value.trim();
+    const quality = $("listing-quality").value;
+    const size = $("listing-size").value;
+    const outputCountRaw = $("listing-output-count").value.trim();
+    const images = $("listing-images").files;
+
+    if (!teamId) return (box.textContent = "enter a team_id in section 7 above first");
+    if (!images || images.length === 0) return (box.textContent = "select at least one product image");
+
+    box.textContent = "planning shots + generating -- results will appear in the section 7 result area above...";
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", "listing_photoshoot");
+    if (prompt) formData.append("prompt", prompt);
+    if (quality) formData.append("quality", quality);
+    if (size) formData.append("size", size);
+    if (outputCountRaw) formData.append("output_count", outputCountRaw);
+    for (const file of images) formData.append("images", file);
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.batchId) {
+      box.textContent = "failed to start -- see log below";
+      return;
+    }
+
+    box.textContent = `started batch ${data.batchId} (${data.jobs.length} shot${data.jobs.length === 1 ? "" : "s"}) -- see section 7 result area above`;
+    startPollingBatch(data.batchId);
   };
 
   $("lookup-job-btn").onclick = () => {

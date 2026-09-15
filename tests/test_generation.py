@@ -97,6 +97,96 @@ def test_create_batch_rejected_when_lock_already_held(monkeypatch):
     spend.assert_not_called()  # lock is checked before anything else touches credits
 
 
+# --------------------------------------------------------------------------- #
+# Orphaned-lock self-healing: a crash/restart between acquire_generation_lock()
+# and the job being created (or the except-block release running) leaves the
+# lock stranded with nothing backing it. create_generation_batch must clear
+# it and proceed ONLY when the lock is old enough to rule out a genuinely
+# in-flight request AND there's no real job in the DB behind it.
+# --------------------------------------------------------------------------- #
+
+def _multi_model_db(tool, active_job):
+    """Distinguishes the ToolDefinition lookup from the GenerationJob
+    active-check -- a single db.query(...).filter(...).first() mock can't
+    tell these apart since both create_generation_batch's own tool lookup
+    and _user_has_active_generation_job's check share that exact shape."""
+    db = MagicMock()
+
+    def query(model):
+        q = MagicMock()
+        name = getattr(model, "__name__", "")
+        if name == "ToolDefinition":
+            q.filter.return_value.first.return_value = tool
+        elif name == "GenerationJob":
+            q.filter.return_value.first.return_value = active_job
+        return q
+
+    db.query.side_effect = query
+    return db
+
+
+def test_stale_lock_is_cleared_and_retried_when_old_enough_and_no_active_job(monkeypatch):
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", MagicMock(side_effect=[False, True]))
+    released = []
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: released.append(uid))
+    monkeypatch.setattr(generation_svc, "generation_lock_age_seconds", lambda uid: 45)  # > STALE_LOCK_GRACE_SECONDS
+    monkeypatch.setattr(generation_svc, "spend_credits", MagicMock(return_value=(MagicMock(), 5, 0)))
+    user_id = uuid.uuid4()
+    db = _multi_model_db(_tool(credit_cost=5), active_job=None)  # no active job backing the lock
+
+    jobs = generation_svc.create_generation_batch(db, TEAM_ID, user_id, "test_tool", {})
+
+    assert len(jobs) == 1  # succeeded -- the stale lock did not block it
+    assert released == [user_id]
+
+
+def test_lock_stays_blocked_when_a_real_active_job_backs_it(monkeypatch):
+    """The lock is old enough to otherwise qualify as stale, but a real
+    queued/processing job is actually backing it -- must NOT be cleared."""
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: False)
+    released = []
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: released.append(uid))
+    monkeypatch.setattr(generation_svc, "generation_lock_age_seconds", lambda uid: 45)
+    db = _multi_model_db(_tool(), active_job=MagicMock())  # a real active job exists
+
+    with pytest.raises(ValueError, match="already have a generation in progress"):
+        generation_svc.create_generation_batch(db, TEAM_ID, uuid.uuid4(), "test_tool", {})
+
+    assert released == []  # never touched -- a real job is backing this lock
+
+
+def test_lock_stays_blocked_when_too_recent_even_with_no_active_job(monkeypatch):
+    """Protects a genuinely in-flight request: job creation just hasn't
+    committed yet, so no DB row exists -- but the lock is too young to
+    assume it's orphaned rather than mid-flight."""
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: False)
+    released = []
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: released.append(uid))
+    monkeypatch.setattr(generation_svc, "generation_lock_age_seconds", lambda uid: 5)  # well under the grace period
+    db = _multi_model_db(_tool(), active_job=None)
+
+    with pytest.raises(ValueError, match="already have a generation in progress"):
+        generation_svc.create_generation_batch(db, TEAM_ID, uuid.uuid4(), "test_tool", {})
+
+    assert released == []
+
+
+def test_lock_stays_blocked_when_age_is_unknown(monkeypatch):
+    """generation_lock_age_seconds returns None when the lock key doesn't
+    actually exist in Redis (e.g. a race where it expired between the failed
+    acquire and this check) -- must fail closed, never self-heal on unknown age."""
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: False)
+    released = []
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: released.append(uid))
+    monkeypatch.setattr(generation_svc, "generation_lock_age_seconds", lambda uid: None)
+    db = _multi_model_db(_tool(), active_job=None)
+
+    with pytest.raises(ValueError, match="already have a generation in progress"):
+        generation_svc.create_generation_batch(db, TEAM_ID, uuid.uuid4(), "test_tool", {})
+
+    assert released == []
+
+
 def test_create_batch_releases_lock_on_unknown_tool(monkeypatch):
     monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: True)
     released = []
@@ -163,6 +253,95 @@ def test_create_batch_success_charges_and_keeps_lock_held(monkeypatch):
     db.add.assert_called_once_with(job)
     db.commit.assert_called_once()  # spend + job insert land in ONE transaction
     assert released == []  # lock stays held until the webhook resolves the job
+
+
+# --------------------------------------------------------------------------- #
+# per_job_overrides -- listing_photoshoot's own path: N jobs, each with its
+# own planned prompt merged over the shared input_params, instead of every
+# job in the batch sharing one identical input_params dict.
+# --------------------------------------------------------------------------- #
+
+def test_per_job_overrides_gives_each_job_its_own_distinct_input_params(monkeypatch):
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: True)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    monkeypatch.setattr(generation_svc, "spend_credits", MagicMock(return_value=(MagicMock(), 6, 0)))
+    db = _job_db(_tool(credit_cost=3))
+
+    overrides = [
+        {"prompt": "Hero shot, studio lighting", "shot_type": "hero"},
+        {"prompt": "Side angle, studio lighting", "shot_type": "side"},
+    ]
+    shared_input = {"size": "1:1", "image_urls": ["https://fal.test/product.png"]}
+
+    jobs = generation_svc.create_generation_batch(
+        db, TEAM_ID, uuid.uuid4(), "listing_photoshoot", shared_input,
+        per_job_overrides=overrides,
+    )
+
+    assert len(jobs) == 2
+    assert jobs[0].input_params == {**shared_input, **overrides[0]}
+    assert jobs[1].input_params == {**shared_input, **overrides[1]}
+    assert jobs[0].input_params["prompt"] == "Hero shot, studio lighting"
+    assert jobs[1].input_params["prompt"] == "Side angle, studio lighting"
+    # the shared fields survive on every job, not just the first
+    assert jobs[0].input_params["size"] == "1:1"
+    assert jobs[1].input_params["size"] == "1:1"
+
+
+def test_per_job_overrides_length_wins_even_when_output_count_argument_disagrees(monkeypatch):
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: True)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    monkeypatch.setattr(generation_svc, "spend_credits", MagicMock(return_value=(MagicMock(), 9, 0)))
+    db = _job_db(_tool(credit_cost=3, default_output_count=4))
+
+    overrides = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+
+    jobs = generation_svc.create_generation_batch(
+        db, TEAM_ID, uuid.uuid4(), "listing_photoshoot", {},
+        output_count=1,  # deliberately disagrees with len(overrides)
+        per_job_overrides=overrides,
+    )
+
+    assert len(jobs) == 3  # overrides length wins, not the output_count argument
+
+
+def test_per_job_overrides_splits_credits_correctly_across_all_jobs(monkeypatch):
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: True)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    monkeypatch.setattr(generation_svc, "spend_credits", MagicMock(return_value=(MagicMock(), 7, 2)))
+    db = _job_db(_tool(credit_cost=3))
+
+    overrides = [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}]
+
+    jobs = generation_svc.create_generation_batch(
+        db, TEAM_ID, uuid.uuid4(), "listing_photoshoot", {}, per_job_overrides=overrides,
+    )
+
+    assert len(jobs) == 3
+    assert all(j.credits_charged == 3 for j in jobs)
+    # 7 // 3 = 2 each, remainder 1 on the first job; 2 // 3 = 0 each, remainder 2 on the first job
+    assert [j.credits_from_subscription for j in jobs] == [3, 2, 2]
+    assert [j.credits_from_topup for j in jobs] == [2, 0, 0]
+    assert sum(j.credits_from_subscription for j in jobs) == 7
+    assert sum(j.credits_from_topup for j in jobs) == 2
+
+
+def test_without_per_job_overrides_every_job_shares_the_identical_input_params(monkeypatch):
+    """Regression guard: every OTHER existing tool's behavior must stay
+    exactly as before -- one shared input_params dict, not accidentally
+    forked per job."""
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: True)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    monkeypatch.setattr(generation_svc, "spend_credits", MagicMock(return_value=(MagicMock(), 10, 0)))
+    db = _job_db(_tool(credit_cost=5))
+
+    shared_input = {"color": "red", "image_urls": ["https://fal.test/1.png"]}
+    jobs = generation_svc.create_generation_batch(db, TEAM_ID, uuid.uuid4(), "recolor", shared_input, output_count=2)
+
+    assert len(jobs) == 2
+    assert jobs[0].input_params == shared_input
+    assert jobs[1].input_params == shared_input
+    assert jobs[0].input_params is jobs[1].input_params is shared_input  # the exact same object, not a copy
 
 
 def test_create_batch_spends_credits_without_committing_separately(monkeypatch):
@@ -260,6 +439,44 @@ def test_create_batch_uses_tool_default_output_count_when_not_specified(monkeypa
 
     assert len(jobs) == 3
     spend.assert_called_once_with(db, TEAM_ID, 15, commit=False)  # 5 * 3, not 5 * 0
+
+
+def test_misconfigured_zero_default_output_count_raises_a_clean_value_error(monkeypatch):
+    """Regression: output_count is later used as a divisor for the
+    credit-pool split. A tool_definitions row hand-edited via SQL to
+    default_output_count=0 (or negative) used to reach that division
+    directly and crash with an unhandled ZeroDivisionError -- which isn't a
+    ValueError, so /generate's `except ValueError` never caught it and the
+    request 500'd instead of failing cleanly. Must raise ValueError instead,
+    same as every other "this request can't be fulfilled" case here."""
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: True)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    spend = MagicMock(return_value=(MagicMock(), 0, 0))
+    monkeypatch.setattr(generation_svc, "spend_credits", spend)
+    db = _job_db(_tool(default_output_count=0))
+
+    with pytest.raises(ValueError, match="output_count must be between 1"):
+        generation_svc.create_generation_batch(db, TEAM_ID, uuid.uuid4(), "test_tool", {}, output_count=0)
+
+    spend.assert_not_called()  # rejected before any credits are touched
+
+
+def test_output_count_over_the_max_raises_a_clean_value_error_even_from_a_tool_default(monkeypatch):
+    """The MAX_OUTPUT_COUNT cap (see app/routes/generation.py) previously only
+    guarded a caller-supplied output_count -- a tool_definitions row whose
+    default_output_count exceeds it (DB-only misconfiguration, but nothing
+    enforced it) could still create an oversized batch. Now enforced here too,
+    on the resolved value regardless of where it came from."""
+    monkeypatch.setattr(generation_svc, "acquire_generation_lock", lambda uid: True)
+    monkeypatch.setattr(generation_svc, "release_generation_lock", lambda uid: None)
+    spend = MagicMock()
+    monkeypatch.setattr(generation_svc, "spend_credits", spend)
+    db = _job_db(_tool(default_output_count=generation_svc.MAX_OUTPUT_COUNT + 1))
+
+    with pytest.raises(ValueError, match="output_count must be between 1"):
+        generation_svc.create_generation_batch(db, TEAM_ID, uuid.uuid4(), "test_tool", {}, output_count=0)
+
+    spend.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -787,6 +1004,73 @@ def test_generate_rejects_output_count_over_the_cap_before_any_upload(gen_client
     upload.assert_not_called()
 
 
+def test_generate_omitted_output_count_does_not_reject_with_500(gen_client, monkeypatch):
+    """output_count left off the request entirely must not crash the
+    MAX_OUTPUT_COUNT comparison (None > int) -- regression guard for the
+    Form(1) -> Form(None) change that made tool.default_output_count
+    actually reachable."""
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=5, param_schema=[])
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", MagicMock(return_value="https://fal.test/x.png"))
+    monkeypatch.setattr(
+        "app.routes.generation.create_generation_batch",
+        MagicMock(return_value=[MagicMock(id=uuid.uuid4(), batch_id=uuid.uuid4(), status="queued")]),
+    )
+
+    async def fake_get_arq_pool():
+        pool = MagicMock()
+
+        async def enqueue_job(*a, **k):
+            return None
+        pool.enqueue_job = enqueue_job
+        return pool
+    monkeypatch.setattr("app.routes.generation.get_arq_pool", fake_get_arq_pool)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "test_tool"},  # no output_count at all
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 200
+
+
+def test_generate_omitting_output_count_lets_listing_photoshoot_reach_its_own_default(gen_client, monkeypatch):
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        max_input_images=5, default_output_count=4, param_schema=[],
+    )
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", MagicMock(return_value="https://fal.test/x.png"))
+    plan = MagicMock(return_value=[{"shot_type": "hero", "prompt": "x"}] * 4)
+    monkeypatch.setattr("app.routes.generation.plan_listing_shots", plan)
+    monkeypatch.setattr(
+        "app.routes.generation.create_generation_batch",
+        MagicMock(return_value=[MagicMock(id=uuid.uuid4(), batch_id=uuid.uuid4(), status="queued") for _ in range(4)]),
+    )
+
+    async def fake_get_arq_pool():
+        pool = MagicMock()
+
+        async def enqueue_job(*a, **k):
+            return None
+        pool.enqueue_job = enqueue_job
+        return pool
+    monkeypatch.setattr("app.routes.generation.get_arq_pool", fake_get_arq_pool)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "listing_photoshoot"},  # no output_count at all
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 200
+    plan.assert_called_once_with(db.query.return_value.filter.return_value.first.return_value, ["https://fal.test/x.png"], None, 4)
+
+
 def test_generate_rejects_missing_required_field_before_any_upload(gen_client, monkeypatch):
     client, fake_user, db = gen_client
     monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
@@ -886,6 +1170,180 @@ def test_generate_uploads_every_image_and_passes_all_urls_through(gen_client, mo
     assert upload.call_count == 2
     # image_urls is ALWAYS a list, in upload order, one URL per uploaded file
     assert captured["input_params"]["image_urls"] == ["https://fal.test/1.png", "https://fal.test/2.png"]
+
+
+def test_generate_forwards_idea_field_for_creative_photoshoot(gen_client, monkeypatch):
+    """creative_photoshoot needs "idea" -- not one of Recolor's fields --
+    forwarded through to create_generation_batch, same class of gap that
+    previously blocked enhance_prompt's "prompt"/"source_feature_type"."""
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        max_input_images=5,
+        param_schema=[
+            {"name": "idea", "type": "select", "label": "Idea", "options": ["Sci-Fi", "Luxury"], "required": False},
+            {"name": "prompt", "type": "text", "label": "Prompt", "required": False},
+        ],
+    )
+    upload = MagicMock(return_value="https://fal.test/uploaded.png")
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", upload)
+
+    captured = {}
+
+    def fake_create_batch(db_, team_id, user_id, feature_type, input_params, output_count):
+        captured["input_params"] = input_params
+        return [MagicMock(id=uuid.uuid4(), batch_id=uuid.uuid4(), status="queued")]
+    monkeypatch.setattr("app.routes.generation.create_generation_batch", fake_create_batch)
+
+    async def fake_get_arq_pool():
+        pool = MagicMock()
+
+        async def enqueue_job(*a, **k):
+            return None
+        pool.enqueue_job = enqueue_job
+        return pool
+    monkeypatch.setattr("app.routes.generation.get_arq_pool", fake_get_arq_pool)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "creative_photoshoot", "idea": "Sci-Fi"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 200
+    assert captured["input_params"]["idea"] == "Sci-Fi"
+
+
+def test_generate_plans_shots_and_uses_per_job_overrides_for_listing_photoshoot(gen_client, monkeypatch):
+    """listing_photoshoot is the one tool where /generate must NOT call
+    create_generation_batch with a single shared input_params -- it plans N
+    distinct shots first and passes per_job_overrides instead."""
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    tool = MagicMock(
+        max_input_images=5, default_output_count=4,
+        param_schema=[{"name": "prompt", "type": "text", "label": "Prompt", "required": False}],
+    )
+    db.query.return_value.filter.return_value.first.return_value = tool
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", MagicMock(return_value="https://fal.test/uploaded.png"))
+
+    planned_shots = [
+        {"shot_type": "hero", "prompt": "Hero shot, studio lighting"},
+        {"shot_type": "side", "prompt": "Side angle, studio lighting"},
+    ]
+    plan = MagicMock(return_value=planned_shots)
+    monkeypatch.setattr("app.routes.generation.plan_listing_shots", plan)
+
+    captured = {}
+
+    def fake_create_batch(db_, team_id, user_id, feature_type, input_params, output_count=1, per_job_overrides=None, lock_already_held=False):
+        captured["output_count"] = output_count
+        captured["per_job_overrides"] = per_job_overrides
+        return [MagicMock(id=uuid.uuid4(), batch_id=uuid.uuid4(), status="queued") for _ in (per_job_overrides or [None])]
+    monkeypatch.setattr("app.routes.generation.create_generation_batch", fake_create_batch)
+
+    async def fake_get_arq_pool():
+        pool = MagicMock()
+
+        async def enqueue_job(*a, **k):
+            return None
+        pool.enqueue_job = enqueue_job
+        return pool
+    monkeypatch.setattr("app.routes.generation.get_arq_pool", fake_get_arq_pool)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "listing_photoshoot"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 200
+    plan.assert_called_once_with(tool, ["https://fal.test/uploaded.png"], None, 4)  # falls back to tool.default_output_count
+    assert captured["per_job_overrides"] == planned_shots
+    assert captured["output_count"] == 4
+
+
+def test_generate_never_plans_shots_when_a_generation_is_already_in_progress(gen_client, monkeypatch):
+    """Real bug found live: the lock used to be checked INSIDE
+    create_generation_batch, which only runs AFTER plan_listing_shots -- a
+    request that was going to be rejected anyway still burned a real,
+    billable fal vision call for nothing. The lock must be checked first."""
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        max_input_images=5, default_output_count=4, param_schema=[],
+    )
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", MagicMock(return_value="https://fal.test/x.png"))
+    monkeypatch.setattr("app.routes.generation.acquire_or_heal_generation_lock", lambda db, uid: False)
+    plan = MagicMock()
+    monkeypatch.setattr("app.routes.generation.plan_listing_shots", plan)
+    create_batch = MagicMock()
+    monkeypatch.setattr("app.routes.generation.create_generation_batch", create_batch)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "listing_photoshoot"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 400
+    assert "already have a generation in progress" in res.json()["detail"]
+    plan.assert_not_called()  # the whole point -- never burn the billable call
+    create_batch.assert_not_called()
+
+
+def test_generate_releases_the_lock_itself_when_shot_planning_fails_after_acquiring_it(gen_client, monkeypatch):
+    """The route acquires the lock itself before planning (lock_already_held
+    passes ownership to create_generation_batch only on success) -- if
+    planning fails, the route must release it, or every subsequent request
+    from this user would be wrongly blocked until the lock's TTL expires."""
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        max_input_images=5, default_output_count=4, param_schema=[],
+    )
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", MagicMock(return_value="https://fal.test/x.png"))
+    monkeypatch.setattr("app.routes.generation.acquire_or_heal_generation_lock", lambda db, uid: True)
+    monkeypatch.setattr("app.routes.generation.plan_listing_shots", MagicMock(side_effect=RuntimeError("fal is down")))
+    release = MagicMock()
+    monkeypatch.setattr("app.routes.generation.release_generation_lock", release)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "listing_photoshoot"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 503
+    release.assert_called_once_with(fake_user.id)
+
+
+def test_generate_surfaces_a_clean_503_when_shot_planning_fails(gen_client, monkeypatch):
+    """The vision call is a real, billable external request -- a raw
+    exception must not leak as an unhandled 500."""
+    client, fake_user, db = gen_client
+    monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        max_input_images=5, default_output_count=4, param_schema=[],
+    )
+    monkeypatch.setattr("app.routes.generation.upload_image_to_fal", MagicMock(return_value="https://fal.test/uploaded.png"))
+    monkeypatch.setattr("app.routes.generation.plan_listing_shots", MagicMock(side_effect=RuntimeError("fal is down")))
+    create_batch = MagicMock()
+    monkeypatch.setattr("app.routes.generation.create_generation_batch", create_batch)
+
+    res = client.post(
+        "/generate",
+        data={"team_id": str(TEAM_ID), "feature_type": "listing_photoshoot"},
+        files=[("images", ("test.png", b"fake-image-bytes", "image/png"))],
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert res.status_code == 503
+    create_batch.assert_not_called()  # never charged/created anything after the planning failure
 
 
 def test_generate_accepts_enhance_prompt_with_no_images(gen_client, monkeypatch):

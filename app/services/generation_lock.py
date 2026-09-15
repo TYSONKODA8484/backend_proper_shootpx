@@ -18,6 +18,25 @@ def release_generation_lock(user_id) -> None:
     redis_client.delete(key)
 
 
+def generation_lock_age_seconds(user_id):
+    """
+    None if no lock is currently held for this user; otherwise roughly how
+    many seconds ago it was acquired (derived from the key's remaining TTL,
+    since Redis doesn't track acquisition time directly).
+
+    Used to self-heal a lock orphaned by a crash/restart between
+    acquire_generation_lock() and the job actually being created or the
+    except-block release running -- a hard process kill mid-request skips
+    that cleanup entirely, otherwise stranding the lock for the full 5-minute
+    TTL. See create_generation_batch's stale-lock check.
+    """
+    key = f"genlock:user:{user_id}"
+    ttl = redis_client.ttl(key)
+    if ttl is None or ttl < 0:
+        return None
+    return LOCK_TTL_SECONDS - ttl
+
+
 def try_reserve_fal_slot(team_id) -> bool:
     """
     Enforces the per-team cap only: fal has no per-team concept of its own,

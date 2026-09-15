@@ -5,6 +5,7 @@ import pytest
 from app.core.limiter import limiter
 from app import worker
 from app.services import generation as generation_svc
+from app.services import tool_definitions as tool_definitions_svc
 
 
 @pytest.fixture(autouse=True)
@@ -36,3 +37,18 @@ def _mock_fal_slot_by_default(monkeypatch):
     monkeypatch.setattr(generation_svc, "release_fal_slot", MagicMock())
     monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
     monkeypatch.setattr(worker, "try_reserve_fal_slot", MagicMock(return_value=True))
+
+
+@pytest.fixture(autouse=True)
+def _disable_tool_definition_cache(monkeypatch):
+    """get_tool_definition() caches ToolDefinition rows in real Redis
+    (60s TTL, key "tooldef:<feature_type>"). Almost every test in this suite
+    mocks db.query(...) directly for a ToolDefinition lookup and expects that
+    mock to be hit every time -- a real cache hit would skip the DB entirely
+    and return whatever a PREVIOUS test (or real dev traffic) last cached
+    under the same feature_type, and a real cache set would try to
+    json.dumps() a MagicMock's attributes into actual dev Redis. Same class
+    of bug already hit once with the fal-slot counters above -- force every
+    lookup here to behave as a permanent cache miss with no writes."""
+    monkeypatch.setattr(tool_definitions_svc, "get_cached", lambda key: None)
+    monkeypatch.setattr(tool_definitions_svc, "set_cached", lambda key, value, ttl=None: None)

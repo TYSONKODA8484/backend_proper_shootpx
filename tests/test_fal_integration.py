@@ -211,6 +211,72 @@ def test_submit_calls_the_tools_build_instruction_via_a_thread_and_uses_its_resu
     assert job.status == "processing"
     sent_params = submit.call_args.args[1]
     assert sent_params["prompt"] == "Recolor the detected jacket to color red"
+    # Real bug this guards against: tool.ai_steps is an untouched MagicMock
+    # here (no ai_steps configured), and MagicMock().get("model") is truthy
+    # by default -- before ai_steps["model"] forwarding was scoped to
+    # feature_type=="enhance_prompt", this silently injected a spurious
+    # "model" key (a MagicMock object) into gpt-image-2/edit's real payload
+    # for every tool going through TOOL_HANDLERS, recolor included.
+    assert "model" not in sent_params
+
+
+def test_ai_steps_model_is_forwarded_for_enhance_prompt(monkeypatch):
+    """enhance_prompt's real fal model (openrouter/router) needs an explicit
+    "model" field to pick the underlying LLM -- tool.ai_steps["model"] must
+    still reach the payload for this one tool."""
+    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+                     feature_type="enhance_prompt", credits_charged=5,
+                     credits_from_subscription=3, credits_from_topup=2,
+                     input_params={"prompt": "make it pop", "source_feature_type": "recolor"})
+    tool = _tool(feature_type="enhance_prompt")
+    tool.ai_steps = {"model": "google/gemini-2.5-flash"}
+    db = _worker_db(job, tool)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    build_instruction = MagicMock(return_value="Rewrite this prompt: make it pop")
+    monkeypatch.setattr(worker, "TOOL_HANDLERS", {"enhance_prompt": build_instruction})
+    submit = MagicMock(return_value="fal-req-1")
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    assert job.status == "processing"
+    sent_params = submit.call_args.args[1]
+    assert sent_params["model"] == "google/gemini-2.5-flash"
+
+
+def test_ai_steps_model_is_not_forwarded_for_other_tools_even_if_accidentally_set(monkeypatch):
+    """Real landmine this guards against: tool.ai_steps is a raw JSONB column
+    hand-edited via SQL with no schema enforcement. gpt-image-2/edit (recolor's
+    and creative_photoshoot's real fal model) has NO "model" field in its
+    schema -- if a top-level "model" key is ever accidentally added to one of
+    THEIR tool_definitions rows (easy mistake: nested steps like
+    detect_target/scene_vision already use "model" as a sub-key), it must
+    never reach the real generation payload and break every submission for
+    that tool."""
+    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+                     feature_type="recolor", credits_charged=5,
+                     credits_from_subscription=3, credits_from_topup=2,
+                     input_params={"color": "red"})
+    tool = _tool(feature_type="recolor")
+    tool.ai_steps = {"model": "accidentally-set-top-level", "detect_target": {"model": "fal-ai/moondream-next"}}
+    db = _worker_db(job, tool)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    build_instruction = MagicMock(return_value="Recolor the jacket to color red")
+    monkeypatch.setattr(worker, "TOOL_HANDLERS", {"recolor": build_instruction})
+    submit = MagicMock(return_value="fal-req-1")
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    assert job.status == "processing"
+    sent_params = submit.call_args.args[1]
+    assert "model" not in sent_params
 
 
 def test_duplicate_run_after_failure_does_not_double_refund(monkeypatch):

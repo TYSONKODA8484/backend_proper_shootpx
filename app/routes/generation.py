@@ -12,23 +12,22 @@ from app.core.limiter import limiter
 from app.deps import get_current_user
 from app.models.user import User
 from app.services.teams import is_team_member
-from app.services.generation import create_generation_batch, fail_and_release, handle_fal_webhook, validate_input_params
+from app.services.generation import (
+    create_generation_batch, fail_and_release, handle_fal_webhook, validate_input_params,
+    acquire_or_heal_generation_lock, ALREADY_IN_PROGRESS_MESSAGE, MAX_OUTPUT_COUNT,
+)
+from app.services.generation_lock import release_generation_lock
 from app.models.generation_job import GenerationJob
-from app.models.tool_definition import ToolDefinition
 from app.core.arq_pool import get_arq_pool
 from app.core.fal_client import upload_image_to_fal
+from app.tools.listing_planner import plan_listing_shots
+from app.services.tool_definitions import get_tool_definition
 
 # 10 MB/image is generous for a product photo while still bounding memory use
 # (await image.read() loads the whole file) and fal upload cost for obviously
 # bad input.
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
 ALLOWED_IMAGE_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp"}
-
-# output_count was previously bounded only by the team's credit balance, not
-# by any sane per-request cap -- a typo (an extra zero) could create an
-# enormous batch (thousands of DB rows + arq jobs) in one call for any team
-# with enough credits. This is a request-shape limit, independent of cost.
-MAX_OUTPUT_COUNT = 20
 
 router = APIRouter(tags=["generation"])
 
@@ -52,7 +51,8 @@ async def generate(
     target_area: str = Form(None),
     prompt: str = Form(None),
     source_feature_type: str = Form(None),
-    output_count: int = Form(1),
+    idea: str = Form(None),
+    output_count: int = Form(None),
     images: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -60,9 +60,7 @@ async def generate(
     if not is_team_member(db, team_id, user.id):
         raise HTTPException(status_code=403, detail="You are not a member of this team")
 
-    tool_check = db.query(ToolDefinition).filter(
-        ToolDefinition.feature_type == feature_type
-    ).first()
+    tool_check = get_tool_definition(db, feature_type)
     if not tool_check:
         raise HTTPException(status_code=400, detail="Unknown tool")
 
@@ -72,7 +70,11 @@ async def generate(
             detail=f"This tool accepts at most {tool_check.max_input_images} image(s)",
         )
 
-    if output_count > MAX_OUTPUT_COUNT:
+    # output_count left unset (None) means "use this tool's own default" --
+    # was previously a hardcoded Form(1), which made tool.default_output_count
+    # unreachable for every tool (listing_photoshoot's default of 4 could
+    # never actually take effect without the caller explicitly passing 4).
+    if output_count is not None and output_count > MAX_OUTPUT_COUNT:
         raise HTTPException(
             status_code=400,
             detail=f"output_count cannot exceed {MAX_OUTPUT_COUNT} per request",
@@ -86,7 +88,7 @@ async def generate(
             tool_check.param_schema,
             {
                 "color": color, "quality": quality, "size": size, "target_area": target_area,
-                "prompt": prompt, "source_feature_type": source_feature_type,
+                "prompt": prompt, "source_feature_type": source_feature_type, "idea": idea,
             },
         )
     except ValueError as e:
@@ -123,12 +125,38 @@ async def generate(
         "target_area": target_area,
         "prompt": prompt,
         "source_feature_type": source_feature_type,
+        "idea": idea,
         "image_urls": image_urls,  # always a list now, even for single-image tools
     }
     input_params = {k: v for k, v in input_params.items() if v is not None}
 
     try:
-        jobs = create_generation_batch(db, team_id, user.id, feature_type, input_params, output_count)
+        if feature_type == "listing_photoshoot":
+            # The billable shot-planning vision call must not run at all if a
+            # generation is already in progress -- it used to sit BEFORE
+            # create_generation_batch's own lock check, so a request that was
+            # going to be rejected anyway still burned a real fal vision call
+            # for nothing. Acquire (or heal) the lock here first; on any
+            # failure before create_generation_batch takes over ownership of
+            # it, this code path must release it itself.
+            if not acquire_or_heal_generation_lock(db, user.id):
+                raise HTTPException(status_code=400, detail=ALREADY_IN_PROGRESS_MESSAGE)
+
+            effective_output_count = output_count if output_count and output_count > 0 else tool_check.default_output_count
+            try:
+                shots = plan_listing_shots(tool_check, image_urls, prompt, effective_output_count)
+            except Exception:
+                release_generation_lock(user.id)
+                raise HTTPException(status_code=503, detail="Failed to plan listing shots. Please try again.")
+
+            per_job_overrides = [{"prompt": shot["prompt"], "shot_type": shot["shot_type"]} for shot in shots]
+            jobs = create_generation_batch(
+                db, team_id, user.id, feature_type, input_params,
+                effective_output_count, per_job_overrides=per_job_overrides,
+                lock_already_held=True,
+            )
+        else:
+            jobs = create_generation_batch(db, team_id, user.id, feature_type, input_params, output_count)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
