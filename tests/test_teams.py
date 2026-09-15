@@ -45,6 +45,16 @@ def test_delete_team_requires_auth():
     assert res.status_code == 401
 
 
+def test_list_invites_requires_auth():
+    res = client.get(f"/teams/{FAKE_TEAM}/invites")
+    assert res.status_code == 401
+
+
+def test_cancel_invite_requires_auth():
+    res = client.delete(f"/teams/{FAKE_TEAM}/invites/{uuid.uuid4()}")
+    assert res.status_code == 401
+
+
 def test_remove_member_blocks_last_owner(monkeypatch):
     from unittest.mock import MagicMock
 

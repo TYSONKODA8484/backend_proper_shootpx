@@ -149,16 +149,17 @@ def test_duplicate_run_after_success_does_not_resubmit(monkeypatch):
     refund.assert_not_called()             # and definitely no refund fired
 
 
-def test_submit_translates_quality_and_size_before_sending_to_fal(monkeypatch):
-    """The params dict actually sent to fal.ai must carry the translated
-    values (low/medium/high, image_size preset) -- job.input_params (read
-    back via GET /jobs and /batches) must keep the original user-facing
-    values untouched."""
+def test_submit_translates_size_and_passes_quality_through_before_sending_to_fal(monkeypatch):
+    """The params dict actually sent to fal.ai must carry the translated size
+    (image_size preset) -- quality is stored as fal's own real enum value
+    directly (auto/low/medium/high) now, so it must reach fal unchanged, not
+    translated. job.input_params (read back via GET /jobs and /batches) must
+    keep the original user-facing values untouched either way."""
     job = MagicMock(
         id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
         feature_type="test_tool",  # no TOOL_HANDLERS entry -- isolates the translation step itself
         credits_charged=5, credits_from_subscription=3, credits_from_topup=2,
-        input_params={"color": "red", "quality": "premium", "size": "9:16"},
+        input_params={"color": "red", "quality": "high", "size": "9:16"},
     )
     original_input_params = dict(job.input_params)
     tool = _tool()
@@ -174,12 +175,42 @@ def test_submit_translates_quality_and_size_before_sending_to_fal(monkeypatch):
 
     assert job.status == "processing"
     sent_params = submit.call_args.args[1]
-    assert sent_params["quality"] == "high"          # premium -> high
+    assert sent_params["quality"] == "high"              # already fal's real value -- unchanged
     assert sent_params["image_size"] == "portrait_16_9"  # 9:16 -> portrait_16_9
     assert "size" not in sent_params
 
     # job.input_params itself is never touched
     assert job.input_params == original_input_params
+
+
+def test_submit_calls_the_tools_build_instruction_via_a_thread_and_uses_its_result(monkeypatch):
+    """The only existing tests using feature_type="test_tool" never exercise
+    the TOOL_HANDLERS branch at all (no registry entry for it) -- this covers
+    the actual path recolor uses: build_instruction() runs (via
+    asyncio.to_thread, since it can make its own blocking HTTP call -- see
+    the asyncio.to_thread comments in submit_generation_to_fal) and its
+    return value becomes the "prompt" sent to fal.ai."""
+    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+                     feature_type="recolor", credits_charged=5,
+                     credits_from_subscription=3, credits_from_topup=2,
+                     input_params={"color": "red"})
+    tool = _tool(feature_type="recolor")
+    db = _worker_db(job, tool)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    build_instruction = MagicMock(return_value="Recolor the detected jacket to color red")
+    monkeypatch.setattr(worker, "TOOL_HANDLERS", {"recolor": build_instruction})
+    submit = MagicMock(return_value="fal-req-1")
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    build_instruction.assert_called_once_with(job, tool, db)
+    assert job.status == "processing"
+    sent_params = submit.call_args.args[1]
+    assert sent_params["prompt"] == "Recolor the detected jacket to color red"
 
 
 def test_duplicate_run_after_failure_does_not_double_refund(monkeypatch):
@@ -521,4 +552,87 @@ def test_fal_key_never_appears_in_worker_error_message(monkeypatch):
 
     assert settings.fal_key not in job.error_message, (
         "FAL_KEY leaked into job.error_message, which /jobs/{id} returns to any team member"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# reconcile_fal_slots: self-healing against the real Postgres truth for the
+# fal in-flight Redis counters (no TTL on these, unlike the generation lock --
+# a leaked slot from a killed worker would otherwise never self-correct).
+# --------------------------------------------------------------------------- #
+
+def test_reconcile_fal_slots_corrects_undercounted_and_leaked_teams(monkeypatch):
+    """Against real Redis (same pattern as the other real-redis tests above):
+    a team whose Redis count is stale/wrong gets corrected to the real
+    Postgres "processing" count, a team with a pure leak (nonzero Redis,
+    zero real processing jobs) gets reset to 0, and the global counter is
+    recomputed as the sum -- reproducing exactly the corruption found live
+    this session (a per-team counter at 1 with nothing actually processing)."""
+    from app.core.cache import redis_client
+    from app.services.generation_lock import INFLIGHT_KEY_GLOBAL
+
+    team_a = uuid.uuid4()  # DB truth: 2 jobs processing, Redis stale at 0
+    team_b = uuid.uuid4()  # DB truth: 0 jobs processing, Redis leaked at 5
+    key_a = f"fal:inflight_count:{team_a}"
+    key_b = f"fal:inflight_count:{team_b}"
+
+    baseline_global = redis_client.get(INFLIGHT_KEY_GLOBAL)
+    try:
+        redis_client.set(key_a, 0)
+        redis_client.set(key_b, 5)
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.group_by.return_value.all.return_value = [
+            (team_a, 2),
+        ]
+        monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+        _run(worker.reconcile_fal_slots({}))
+
+        assert int(redis_client.get(key_a)) == 2  # corrected up to DB truth
+        assert int(redis_client.get(key_b)) == 0  # leak reset to 0
+        assert int(redis_client.get(INFLIGHT_KEY_GLOBAL)) == 2  # sum of true counts
+    finally:
+        redis_client.delete(key_a)
+        redis_client.delete(key_b)
+        if baseline_global is None:
+            redis_client.delete(INFLIGHT_KEY_GLOBAL)
+        else:
+            redis_client.set(INFLIGHT_KEY_GLOBAL, baseline_global)
+
+
+def test_reconcile_fal_slots_leaves_an_already_correct_team_untouched(monkeypatch):
+    from app.core.cache import redis_client
+    from app.services.generation_lock import INFLIGHT_KEY_GLOBAL
+
+    team_a = uuid.uuid4()
+    key_a = f"fal:inflight_count:{team_a}"
+
+    baseline_global = redis_client.get(INFLIGHT_KEY_GLOBAL)
+    try:
+        redis_client.set(key_a, 3)
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.group_by.return_value.all.return_value = [
+            (team_a, 3),
+        ]
+        monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+        _run(worker.reconcile_fal_slots({}))
+
+        assert int(redis_client.get(key_a)) == 3
+        assert int(redis_client.get(INFLIGHT_KEY_GLOBAL)) == 3
+    finally:
+        redis_client.delete(key_a)
+        if baseline_global is None:
+            redis_client.delete(INFLIGHT_KEY_GLOBAL)
+        else:
+            redis_client.set(INFLIGHT_KEY_GLOBAL, baseline_global)
+
+
+def test_reconcile_fal_slots_is_registered_on_the_worker(monkeypatch):
+    assert worker.reconcile_fal_slots in worker.WorkerSettings.functions
+    assert any(
+        getattr(job, "coroutine", None) is worker.reconcile_fal_slots
+        for job in worker.WorkerSettings.cron_jobs
     )

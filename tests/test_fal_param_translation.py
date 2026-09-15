@@ -1,7 +1,8 @@
-"""app/worker.py::_translate_fal_params -- our param_schema's user-facing
-values (Recolor's standard/advanced/premium tiers, plain aspect-ratio
-strings) must never be sent to fal.ai as-is. Confirmed against fal's real
-schema at https://fal.ai/models/openai/gpt-image-2/edit/api:
+"""app/worker.py::_translate_fal_params -- Recolor's param_schema stores
+"size" as our own plain aspect-ratio strings, which must never be sent to
+fal.ai as-is; "quality" is now stored as fal's own real enum values directly
+(auto/low/medium/high), so it passes through completely untouched. Confirmed
+against fal's real schema at https://fal.ai/models/openai/gpt-image-2/edit/api:
   quality (enum):     auto | low | medium | high
   image_size (enum):  square_hd | square | portrait_4_3 | portrait_16_9 |
                        landscape_4_3 | landscape_16_9 | auto
@@ -14,9 +15,9 @@ import pytest
 
 from app import worker
 
-# The real, complete accepted-value sets from fal's own docs -- if
-# FAL_QUALITY_TRANSLATION / FAL_SIZE_TRANSLATION are ever edited to something
-# outside these, these tests must fail.
+# The real, complete accepted-value set from fal's own docs -- if the
+# quality options stored in recolor's param_schema are ever edited to
+# something outside this set, that's a real 422 waiting to happen.
 FAL_REAL_QUALITY_VALUES = {"auto", "low", "medium", "high"}
 FAL_REAL_IMAGE_SIZE_PRESETS = {
     "square_hd", "square", "portrait_4_3", "portrait_16_9",
@@ -43,35 +44,26 @@ def _is_valid_fal_image_size(value) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# quality: standard/advanced/premium -> low/medium/high
+# quality: stored directly as fal's own real values now (auto/low/medium/
+# high) -- no translation table, passes through completely unchanged.
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("our_value,fal_value", [
-    ("standard", "low"),
-    ("advanced", "medium"),
-    ("premium", "high"),
-])
-def test_quality_translates_to_fals_real_enum_value(our_value, fal_value):
-    result = worker._translate_fal_params({"quality": our_value})
-    assert result["quality"] == fal_value
+@pytest.mark.parametrize("value", ["auto", "low", "medium", "high"])
+def test_every_quality_option_in_recolors_actual_schema_passes_through_unchanged(value):
+    """Cross-check against the literal options our /tools/recolor/schema
+    endpoint now serves -- every value the frontend can possibly send is
+    already one fal genuinely accepts, so _translate_fal_params must not
+    alter it at all."""
+    result = worker._translate_fal_params({"quality": value})
+    assert result["quality"] == value
     assert result["quality"] in FAL_REAL_QUALITY_VALUES
 
 
-def test_quality_translation_covers_every_option_in_recolors_actual_schema():
-    """Cross-check against the literal options our /tools/recolor/schema
-    endpoint serves -- every value the frontend can possibly send must have a
-    translation, and every translation must be one fal genuinely accepts."""
-    schema_quality_values = ["standard", "advanced", "premium"]  # from param_schema's quality select
-    for value in schema_quality_values:
-        translated = worker._translate_fal_params({"quality": value})["quality"]
-        assert translated in FAL_REAL_QUALITY_VALUES, (
-            f"quality={value!r} translated to {translated!r}, which fal does not accept"
-        )
-
-
-def test_unrecognized_quality_value_passes_through_unchanged():
-    """Defensive: an unmapped value must not silently disappear or crash --
-    it passes through so a real fal 422 makes the gap obvious, same as today."""
+def test_unrecognized_quality_value_still_passes_through_unchanged():
+    """Defensive: an unexpected value must not silently disappear or crash --
+    it passes through so a real fal 422 makes the gap obvious. (There's no
+    translation table for quality any more, so this is really just
+    confirming _translate_fal_params never touches the field.)"""
     result = worker._translate_fal_params({"quality": "ultra-mega"})
     assert result["quality"] == "ultra-mega"
 
@@ -115,7 +107,7 @@ def test_unrecognized_size_value_passes_through_under_the_renamed_key():
 # --------------------------------------------------------------------------- #
 
 def test_translation_does_not_mutate_the_input_dict():
-    original = {"quality": "premium", "size": "16:9", "color": "red"}
+    original = {"quality": "high", "size": "16:9", "color": "red"}
     snapshot = dict(original)
 
     worker._translate_fal_params(original)
@@ -128,7 +120,7 @@ def test_color_and_target_area_are_stripped_not_forwarded_to_fal():
     build_instruction() into the `prompt` string -- gpt-image-2/edit's real
     schema has no such fields (prompt, image_urls, image_size, background,
     quality, num_images, output_format, sync_mode, mask_url only)."""
-    result = worker._translate_fal_params({"color": "red", "target_area": "sneaker sole", "quality": "standard"})
+    result = worker._translate_fal_params({"color": "red", "target_area": "sneaker sole", "quality": "low"})
     assert "color" not in result
     assert "target_area" not in result
     assert result["quality"] == "low"
@@ -137,7 +129,7 @@ def test_color_and_target_area_are_stripped_not_forwarded_to_fal():
 def test_full_recolor_payload_translates_cleanly():
     params = {
         "color": "red",
-        "quality": "advanced",
+        "quality": "medium",
         "size": "9:16",
         "target_area": "sneaker sole",
         "image_urls": ["https://fal.test/1.png"],

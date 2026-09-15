@@ -220,6 +220,24 @@ def test_delete_team_with_no_subscription_still_deletes(monkeypatch):
     db.commit.assert_called_once()
 
 
+def test_delete_team_also_clears_generation_jobs_before_deleting_the_team(monkeypatch):
+    """Real bug found live: generation_jobs.team_id is also a FK to teams, but
+    wasn't in the original cleanup list -- any team that ever ran a single
+    generation hit a real Postgres FK violation deleting the Team row. Must
+    be cleared, and before Team itself (FK-child-first ordering)."""
+    from app.models.generation_job import GenerationJob
+    from app.models.team import Team
+
+    monkeypatch.setattr(teams_svc, "cancel_subscription", lambda db, tid: None)
+    db = MagicMock()
+
+    teams_svc.delete_team(db, TEAM_ID)
+
+    queried_models = [c.args[0] for c in db.query.call_args_list]
+    assert GenerationJob in queried_models
+    assert queried_models.index(GenerationJob) < queried_models.index(Team)
+
+
 def test_delete_team_razorpay_failure_still_deletes_and_logs(monkeypatch, caplog):
     def boom(db, tid):
         raise billing_svc.RazorpayCancelError("provider down")

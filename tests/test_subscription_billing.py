@@ -8,6 +8,7 @@ Same trust rules as the credit-pack flow:
     never trusts the webhook payload's own notes
 """
 
+import logging
 import uuid
 from unittest.mock import MagicMock
 
@@ -660,3 +661,39 @@ def test_renewal_notice_never_fires_for_yearly_plans(monkeypatch):
     assert sent == []
     assert refills == []                  # yearly refills are the scheduler's job, not this webhook
     assert team_sub.last_paid_count == 1  # idempotency counter still advances correctly
+
+
+def test_renewal_notice_smtp_failure_does_not_fail_the_whole_webhook(monkeypatch, caplog):
+    """Real gap found live: send_email() previously wasn't wrapped here, so an
+    SMTP hiccup would raise straight through handle_subscription_charged,
+    surfacing as an unhandled 500 to Razorpay for a webhook that actually
+    succeeded (last_paid_count already advanced by this point) -- and since
+    Razorpay's retry would see paid_count <= last_paid_count on redelivery,
+    the notice would never be attempted again. Must be caught, logged, and
+    the rest of the charge (refill, last_paid_count, commit) must still go
+    through."""
+    monkeypatch.setattr(
+        webhooks_svc, "send_email",
+        MagicMock(side_effect=Exception("smtp connection refused")),
+    )
+    refilled = []
+    monkeypatch.setattr(webhooks_svc, "refill_subscription_credits",
+                         lambda *a, **k: refilled.append(a))
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.subscription, "fetch",
+        lambda sid: {"id": sid, "paid_count": 11},   # plan.total_count(12) - 1
+    )
+    plan = FakePlan()
+    team_sub = MagicMock(team_id=str(TEAM_ID), subscription_id=str(SUB_ID),
+                         credits_per_refill=350, last_paid_count=10, status="active")
+    membership = MagicMock(user_id="user-1")
+    owner = MagicMock(id="user-1", email="owner@example.com")
+    db = _charged_db_with_team(team_sub, plan, owner_membership=membership, owner_user=owner)
+
+    with caplog.at_level(logging.ERROR):
+        webhooks_svc.handle_subscription_charged(db, _sub_event("subscription.charged"))  # must not raise
+
+    assert len(refilled) == 1                # the actual credit refill still happened
+    assert team_sub.last_paid_count == 11     # idempotency counter still advanced
+    db.commit.assert_called_once()            # the webhook still completes and commits
+    assert "renewal-notice" in caplog.text.lower()

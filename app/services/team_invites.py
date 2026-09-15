@@ -3,7 +3,9 @@ import secrets
 
 from firebase_admin import auth as firebase_auth
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
+from app.core.cache import acquire_cooldown
 from app.core.config import settings
 from app.core.email import send_email
 from app.models.team import Team
@@ -13,9 +15,19 @@ from app.services.teams import MAX_TEAM_MEMBERS, team_member_count, team_seat_co
 
 logger = logging.getLogger(__name__)
 
+# Separate namespace from authmail's cooldown key -- an email being both
+# invited and independently signing in shouldn't throttle each other.
+INVITE_EMAIL_COOLDOWN_SECONDS = 60
+
 
 class TeamFullError(ValueError):
     """Raised when a team is already at MAX_TEAM_MEMBERS (members + pending invites)."""
+
+
+class InviteEmailRateLimitedError(Exception):
+    """An invite email was already sent to this address too recently. Only
+    per-IP rate limiting on the route previously guarded this -- trivial to
+    rotate past to email-bomb one target address."""
 
 
 def _invite_email_html(team_name: str, link: str, role: str) -> str:
@@ -96,6 +108,11 @@ def create_invite(
     )
     link = firebase_auth.generate_sign_in_with_email_link(email, action_code_settings)
 
+    if not acquire_cooldown(f"invite:cooldown:{email}", INVITE_EMAIL_COOLDOWN_SECONDS):
+        raise InviteEmailRateLimitedError(
+            "An invite email was already sent to this address recently. Please wait a moment and try again."
+        )
+
     send_email(
         to=email,
         subject=f"Invitation to join {team_name} on ShootPX",
@@ -107,6 +124,43 @@ def create_invite(
     )
 
     return invite
+
+
+def list_pending_invites(db: Session, team_id) -> list[dict]:
+    invites = (
+        db.query(TeamInvite)
+        .filter(TeamInvite.team_id == team_id, TeamInvite.status == "pending")
+        .order_by(TeamInvite.created_at)
+        .all()
+    )
+    return [
+        {
+            "id": str(i.id), "email": i.email, "role": i.role,
+            "createdAt": i.created_at.isoformat() if i.created_at else None,
+        }
+        for i in invites
+    ]
+
+
+def cancel_invite(db: Session, team_id, invite_id) -> None:
+    """
+    A mistyped invite, or one nobody ever accepts, previously had no way to
+    be freed -- team_seat_count() counts any "pending" invite toward the
+    MAX_TEAM_MEMBERS cap forever, with no expiry, so a bad invite permanently
+    burned a seat. This lets the owner reclaim it.
+    """
+    invite = (
+        db.query(TeamInvite)
+        .filter(TeamInvite.id == invite_id, TeamInvite.team_id == team_id)
+        .first()
+    )
+    if not invite:
+        raise ValueError("Invite not found")
+    if invite.status != "pending":
+        raise ValueError("Invite is no longer pending")
+
+    invite.status = "cancelled"
+    db.commit()
 
 
 def accept_invite(db: Session, token: str, user_id, user_email: str) -> TeamInvite:
@@ -133,6 +187,17 @@ def accept_invite(db: Session, token: str, user_id, user_email: str) -> TeamInvi
         if team_member_count(db, invite.team_id) >= MAX_TEAM_MEMBERS:
             raise TeamFullError(f"Team is full — max {MAX_TEAM_MEMBERS} members")
         db.add(TeamMember(team_id=invite.team_id, user_id=user_id, role=invite.role))
+        try:
+            db.flush()
+        except IntegrityError:
+            # Two concurrent accept-invite calls for the same user both passed
+            # the "already a member?" check above before either committed --
+            # the DB's own unique constraint on (team_id, user_id) caught the
+            # second one. The other request already created the membership;
+            # nothing left to do here but continue on as already-joined,
+            # rather than surface a confusing error for what is, from the
+            # user's point of view, a successful accept.
+            db.rollback()
     elif member.role != invite.role:
         # already on the team — apply the role from the invite
         member.role = invite.role

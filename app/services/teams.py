@@ -4,6 +4,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.models.billing_transaction import BillingTransaction
+from app.models.generation_job import GenerationJob
 from app.models.team import Team
 from app.models.team_invite import TeamInvite
 from app.models.team_member import TeamMember
@@ -134,7 +135,11 @@ def delete_team(db: Session, team_id) -> None:
             team_id, exc_info=True,
         )
 
-    # FKs to teams are ON DELETE NO ACTION, so every child row must go first.
+    # FKs to teams are ON DELETE NO ACTION, so every child row must go first --
+    # every table with a team_id FK (checked: generation_jobs, billing_transactions,
+    # team_subscriptions, team_invites, team_members) must be listed here, or the
+    # final Team delete below hits a real FK violation for any team that used it.
+    db.query(GenerationJob).filter(GenerationJob.team_id == team_id).delete(synchronize_session=False)
     db.query(BillingTransaction).filter(BillingTransaction.team_id == team_id).delete(synchronize_session=False)
     db.query(TeamSubscription).filter(TeamSubscription.team_id == team_id).delete(synchronize_session=False)
     db.query(TeamInvite).filter(TeamInvite.team_id == team_id).delete(synchronize_session=False)

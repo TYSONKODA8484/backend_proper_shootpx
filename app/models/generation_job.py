@@ -18,6 +18,7 @@ class GenerationJob(Base):
     status = Column(Text, nullable=False, default="queued")
     input_params = Column(JSONB, nullable=False, default=dict)
     output_url = Column(Text, nullable=True)
+    output_text = Column(Text, nullable=True)
     fal_request_id = Column(Text, nullable=True)
     credits_charged = Column(Integer, nullable=False)
     error_message = Column(Text, nullable=True)

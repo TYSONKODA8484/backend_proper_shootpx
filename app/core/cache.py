@@ -35,3 +35,14 @@ def clear_cached(key: str):
         redis_client.delete(key)
     except Exception:
         logger.warning("cache clear failed for %s", key, exc_info=True)
+
+
+def acquire_cooldown(key: str, ttl_seconds: int) -> bool:
+    """
+    Returns True if the cooldown was acquired (this key hasn't been used
+    within ttl_seconds) -- False if it's still on cooldown. For throttling
+    an action keyed by something other than the caller's IP -- e.g. a
+    target email address, so an attacker can't email-bomb one victim by
+    simply rotating IPs past slowapi's per-IP limiter.
+    """
+    return redis_client.set(key, "1", nx=True, ex=ttl_seconds) is not None

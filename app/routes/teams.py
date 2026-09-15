@@ -21,7 +21,10 @@ from app.services.teams import (
     get_team_billing
 )
 from app.schemas.teams import TeamBillingOut
-from app.services.team_invites import accept_invite, create_invite, TeamFullError
+from app.services.team_invites import (
+    accept_invite, cancel_invite, create_invite, list_pending_invites,
+    InviteEmailRateLimitedError, TeamFullError,
+)
 
 router = APIRouter(tags=["teams"])
 
@@ -93,8 +96,41 @@ def invite_to_team(
         invite = create_invite(db, team_id, payload.email, user.id, payload.role)
     except TeamFullError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except InviteEmailRateLimitedError as e:
+        raise HTTPException(status_code=429, detail=str(e))
 
     return {"sent": True, "email": invite.email, "role": invite.role}
+
+
+@router.get("/teams/{team_id}/invites")
+@limiter.limit("30/minute")
+def pending_invites(
+    request: Request,
+    team_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_owner(db, team_id, user)
+    return {"invites": list_pending_invites(db, team_id)}
+
+
+@router.delete("/teams/{team_id}/invites/{invite_id}")
+@limiter.limit("10/minute")
+def cancel_team_invite(
+    request: Request,
+    team_id: UUID,
+    invite_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_owner(db, team_id, user)
+
+    try:
+        cancel_invite(db, team_id, invite_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"cancelled": str(invite_id)}
 
 
 @router.post("/invites/{token}/accept")

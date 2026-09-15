@@ -52,10 +52,11 @@ def fetch_fal_result(model_id: str, request_id: str) -> dict:
     COMPLETED for. COMPLETED only means fal finished processing the request
     -- it does not mean the generation itself succeeded, so this call's own
     HTTP status is what actually distinguishes success from failure. Always
-    returns fal's own webhook shape ({"status": "OK", "payload": ...} or
-    {"status": "ERROR", "error": ...}) so callers can feed the result
-    straight into generation.handle_fal_webhook(), exactly like a real
-    webhook delivery would.
+    returns fal's own webhook shape ({"status": "OK", "payload": ..., "request_id": ...}
+    or {"status": "ERROR", "error": ..., "request_id": ...}) -- including
+    "request_id" matters: handle_fal_webhook() checks it against the job's
+    own stored fal_request_id before applying anything, so callers can feed
+    the result straight into it exactly like a real webhook delivery would.
     """
     response = httpx.get(
         f"https://queue.fal.run/{model_id}/requests/{request_id}",
@@ -67,9 +68,9 @@ def fetch_fal_result(model_id: str, request_id: str) -> dict:
             "fal.ai request %s COMPLETED but the result fetch itself failed [%s]: %s",
             request_id, response.status_code, response.text,
         )
-        return {"status": "ERROR", "error": f"fal.ai generation failed [{response.status_code}]"}
+        return {"status": "ERROR", "error": f"fal.ai generation failed [{response.status_code}]", "request_id": request_id}
 
-    return {"status": "OK", "payload": response.json()}
+    return {"status": "OK", "payload": response.json(), "request_id": request_id}
 
 
 def call_fal_sync(model_id: str, input_params: dict) -> dict:

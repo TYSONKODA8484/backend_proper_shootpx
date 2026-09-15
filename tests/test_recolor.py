@@ -37,7 +37,7 @@ def test_given_target_area_builds_instruction_directly_without_a_vision_call(mon
     job = _job(color="blue", target_area="left sleeve")
     tool = _tool_definition(ai_steps={"detect_target": VISION_STEP})
 
-    instruction = recolor.build_instruction(job, tool)
+    instruction = recolor.build_instruction(job, tool, MagicMock())
 
     assert instruction == "Recolor the left sleeve to color blue"
     call_fal_sync.assert_not_called()
@@ -58,7 +58,7 @@ def test_blank_target_area_calls_the_configured_vision_model(monkeypatch):
     job = _job(color="red", target_area=None, image_urls=["https://fal.test/first.png", "https://fal.test/second.png"])
     tool = _tool_definition(ai_steps={"detect_target": VISION_STEP})
 
-    instruction = recolor.build_instruction(job, tool)
+    instruction = recolor.build_instruction(job, tool, MagicMock())
 
     assert instruction == "Recolor the sneaker sole to color red"
     call_fal_sync.assert_called_once_with(
@@ -77,7 +77,7 @@ def test_blank_target_area_falls_back_to_a_flat_instruction_when_vision_gives_no
     job = _job(color="green", target_area=None)
     tool = _tool_definition(ai_steps={"detect_target": VISION_STEP})
 
-    instruction = recolor.build_instruction(job, tool)
+    instruction = recolor.build_instruction(job, tool, MagicMock())
 
     assert instruction == "Recolor the main product to color green"
 
@@ -91,7 +91,7 @@ def test_blank_target_area_skips_the_vision_call_when_no_detect_target_step_conf
     job = _job(color="black", target_area=None)
     tool = _tool_definition(ai_steps={})  # no detect_target entry
 
-    instruction = recolor.build_instruction(job, tool)
+    instruction = recolor.build_instruction(job, tool, MagicMock())
 
     assert instruction == "Recolor the main product to color black"
     call_fal_sync.assert_not_called()
@@ -106,6 +106,6 @@ def test_blank_target_area_with_no_uploaded_images_still_calls_vision_with_null_
     job = _job(color="red", target_area=None, image_urls=[])
     tool = _tool_definition(ai_steps={"detect_target": VISION_STEP})
 
-    recolor.build_instruction(job, tool)
+    recolor.build_instruction(job, tool, MagicMock())
 
     assert call_fal_sync.call_args.kwargs["input_params"]["image_url"] is None
