@@ -16,6 +16,15 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # A secret pasted into Render's env var UI (or a .env file saved with
+        # a trailing newline) can silently carry a trailing "\n" into the
+        # value. That's invisible everywhere except when the value is later
+        # sent as a raw HTTP header, where h11 rejects it outright
+        # (httpx.LocalProtocolError: "Illegal header value ...\n") -- found
+        # live via supabase_service_role_key breaking every storage upload.
+        # Stripping whitespace on every string field closes this for all
+        # current and future settings, not just this one key.
+        str_strip_whitespace=True,
     )
 
     app_name: str
@@ -44,6 +53,12 @@ class Settings(BaseSettings):
     razorpay_key_id: str
     razorpay_key_secret: str
     razorpay_webhook_secret: str
+    fal_key: str
+    public_backend_url: str
+    supabase_url: str
+    supabase_service_role_key: str
+    fal_concurrency_limit: int
+    fal_per_team_concurrency_limit: int
 
     @property
     def cors_origins_list(self) -> list[str]:

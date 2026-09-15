@@ -8,8 +8,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core.database import get_db
 from app.core.cache import get_cached, set_cached
 from app.models.tool import Tool
+from app.models.tool_definition import ToolDefinition
 from app.schemas.tools import ToolsResponse, ToolOut
 from app.core.limiter import limiter
+from app.deps import get_current_user
+from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
@@ -36,3 +39,34 @@ def get_tools(request: Request, db: Session = Depends(get_db)):
 
     set_cached(CACHE_KEY, response.model_dump(mode="json", by_alias=True))
     return response
+
+
+# --- Tool schema endpoint (backend config, used to build the generate form) ---
+# Separate router: this is NOT a /landing route — it needs real auth, and it
+# deliberately exposes only a filtered subset of tool_definitions.
+tool_config_router = APIRouter(prefix="/tools", tags=["tool-config"])
+
+
+@tool_config_router.get("/{feature_type}/schema")
+@limiter.limit("60/minute")
+def get_tool_schema(
+    feature_type: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    tool = db.query(ToolDefinition).filter(
+        ToolDefinition.feature_type == feature_type,
+        ToolDefinition.stage == 1,
+    ).first()
+
+    if not tool or not tool.is_active:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    # Deliberately return ONLY these two fields — fal_model_id and ai_steps
+    # must never reach the frontend, regardless of what this row contains.
+    return {
+        "featureType": tool.feature_type,
+        "maxInputImages": tool.max_input_images,
+        "paramSchema": tool.param_schema,
+    }

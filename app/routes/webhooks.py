@@ -2,8 +2,16 @@ from fastapi import APIRouter, Request, HTTPException, Header, Depends
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.services.webhooks import verify_webhook_signature, handle_payment_captured
-
+from app.services.webhooks import (
+    verify_webhook_signature,
+    handle_payment_captured,
+    handle_subscription_activated,
+    handle_subscription_charged,
+    handle_subscription_halted,
+    handle_subscription_cancelled,
+    handle_subscription_pending,
+    handle_subscription_completed
+)
 router = APIRouter(prefix="/billing", tags=["webhooks"])
 
 
@@ -20,7 +28,22 @@ async def razorpay_webhook(
 
     event = await request.json()
 
-    if event.get("event") == "payment.captured":
+    event_type = event.get("event")
+
+    if event_type == "payment.captured":
         handle_payment_captured(db, event)
+    elif event_type == "subscription.activated":
+        handle_subscription_activated(db, event)
+    elif event_type == "subscription.charged":
+        handle_subscription_charged(db, event)
+    elif event_type == "subscription.halted":
+        handle_subscription_halted(db, event)
+    elif event_type == "subscription.cancelled":
+        handle_subscription_cancelled(db, event)
+    elif event_type == "subscription.pending":
+        handle_subscription_pending(db, event)
+    elif event_type == "subscription.completed":
+        handle_subscription_completed(db, event)
+        
 
     return {"status": "ok"}

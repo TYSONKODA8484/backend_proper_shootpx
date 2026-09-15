@@ -23,28 +23,34 @@ def add_topup_credits(db: Session, team_id, amount: int, commit: bool = True) ->
     return team
 
 
-def refill_subscription_credits(db: Session, team_id, amount: int) -> Team:
-    """Scheduled periodic refill — replaces, doesn't add. Unused credits lapse."""
+def refill_subscription_credits(db: Session, team_id, amount: int, commit: bool = True) -> Team:
+    """Scheduled periodic refill — replaces, doesn't add. Unused credits lapse.
+
+    Pass commit=False when the caller needs the balance change committed in the
+    same transaction as something else (e.g. the refill worker, which advances
+    next_refill_at atomically with the top-up).
+    """
     team = db.query(Team).filter(Team.id == team_id).with_for_update().first()
     if not team:
         raise ValueError("Team not found")
 
     team.subscription_credits_remaining = amount
-    db.commit()
+    if commit:
+        db.commit()
     return team
 
 
-def spend_credits(db: Session, team_id, amount: int) -> Team:
-    """Deduct for a generation. Drains subscription pool first, then topup wallet."""
+def spend_credits(db: Session, team_id, amount: int, commit: bool = True):
+    """Pass commit=False when the caller needs the deduction committed atomically
+    with something else (e.g. generation job creation, so a failure creating the
+    job can never leave credits spent with no job to account for them)."""
     team = db.query(Team).filter(Team.id == team_id).with_for_update().first()
     if not team:
         raise ValueError("Team not found")
 
     total_available = team.subscription_credits_remaining + team.topup_credits_balance
     if total_available < amount:
-        raise ValueError(
-            f"Insufficient credits. Available: {total_available}, needed: {amount}"
-        )
+        raise ValueError(f"Insufficient credits. Available: {total_available}, needed: {amount}")
 
     from_subscription = min(team.subscription_credits_remaining, amount)
     from_topup = amount - from_subscription
@@ -52,11 +58,12 @@ def spend_credits(db: Session, team_id, amount: int) -> Team:
     team.subscription_credits_remaining -= from_subscription
     team.topup_credits_balance -= from_topup
 
-    db.commit()
-    return team
+    if commit:
+        db.commit()
+    return team, from_subscription, from_topup
 
 
-def refund_credits(db: Session, team_id, amount: int, from_subscription: int, from_topup: int) -> Team:
+def refund_credits(db: Session, team_id, amount: int, from_subscription: int, from_topup: int, commit: bool = True) -> Team:
     """
     Reverse a spend when fal.ai didn't actually charge us.
     Must reverse into the SAME pools the deduction came from, in the same split.
@@ -68,5 +75,6 @@ def refund_credits(db: Session, team_id, amount: int, from_subscription: int, fr
     team.subscription_credits_remaining += from_subscription
     team.topup_credits_balance += from_topup
 
-    db.commit()
+    if commit:
+        db.commit()
     return team
