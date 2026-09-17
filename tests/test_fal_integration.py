@@ -8,6 +8,7 @@ leaks into a stored error message.
 
 import asyncio
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,9 +28,9 @@ limiter.enabled = False
 TEAM_ID = uuid.uuid4()
 
 
-def _tool(feature_type="test_tool", credit_cost=5, active=True, model_id="fake-model"):
+def _tool(feature_type="test_tool", credit_cost=5, active=True, model_id="fake-model", ai_steps=None):
     return MagicMock(feature_type=feature_type, credit_cost_per_output=credit_cost,
-                      is_active=active, fal_model_id=model_id)
+                      is_active=active, fal_model_id=model_id, ai_steps=ai_steps if ai_steps is not None else {})
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +280,206 @@ def test_ai_steps_model_is_not_forwarded_for_other_tools_even_if_accidentally_se
     assert "model" not in sent_params
 
 
+MODEL_SHOOT_GENERATE_MODEL_GENERATION_DEFAULTS = {
+    "quality": "low",
+    "image_size": {"width": 1024, "height": 1024},
+}
+
+
+def test_model_shoot_generate_model_submits_cleanly_with_zero_input_images(monkeypatch):
+    """model_shoot_generate_model's real fal model (openai/gpt-image-2.5/
+    flare/text-to-image) takes no input image at all. /generate's generic
+    path still always writes input_params["image_urls"] = [] for this tool
+    (max_input_images=0 blocks any real upload) -- confirms that flows all
+    the way through submit_generation_to_fal cleanly: no image_urls key
+    reaches fal, no structured-attribute fields leak through either, and the
+    job still reaches 'processing' normally."""
+    job = MagicMock(
+        id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+        feature_type="model_shoot_generate_model", credits_charged=2,
+        credits_from_subscription=2, credits_from_topup=0,
+        input_params={
+            "gender": "Female", "age_bracket": "Adult (30s-40s)", "ethnicity": "South Asian",
+            "skin_tone": "Fair", "body_type": "Slim", "notes": "",
+            "image_urls": [],  # always present, always empty for this tool
+        },
+    )
+    tool = _tool(
+        feature_type="model_shoot_generate_model", model_id="openai/gpt-image-2.5/flare/text-to-image",
+        ai_steps={"generation_defaults": MODEL_SHOOT_GENERATE_MODEL_GENERATION_DEFAULTS},
+    )
+    db = _worker_db(job, tool)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    build_instruction = MagicMock(return_value="A professional studio portrait of an adult South Asian woman.")
+    monkeypatch.setattr(worker, "TOOL_HANDLERS", {"model_shoot_generate_model": build_instruction})
+    submit = MagicMock(return_value="fal-req-1")
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    assert job.status == "processing"
+    assert submit.call_args.args[0] == "openai/gpt-image-2.5/flare/text-to-image"
+    sent_params = submit.call_args.args[1]
+    assert sent_params == {
+        "prompt": "A professional studio portrait of an adult South Asian woman.",
+        "quality": "low",
+        "image_size": {"width": 1024, "height": 1024},
+    }
+    assert "image_urls" not in sent_params
+    for field in ("gender", "age_bracket", "ethnicity", "skin_tone", "body_type", "notes"):
+        assert field not in sent_params
+
+
+def test_model_shoot_generate_models_generation_defaults_reach_the_real_fal_payload(monkeypatch):
+    """Regression test for the real bug found live: the actual outgoing fal
+    request only ever contained {"prompt": ...} -- quality/image_size from
+    tool_definitions.ai_steps.generation_defaults never reached it at all,
+    so the endpoint silently fell back to its own defaults (quality=high, a
+    landscape preset) instead of what's actually configured for this tool.
+    Uses the exact ai_steps.generation_defaults shape from the live DB row."""
+    job = MagicMock(
+        id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+        feature_type="model_shoot_generate_model", credits_charged=2,
+        credits_from_subscription=2, credits_from_topup=0,
+        input_params={
+            "gender": "Male", "age_bracket": "Mature adult (50+)", "ethnicity": "Black",
+            "skin_tone": "Deep", "body_type": "Athletic", "notes": "",
+            "image_urls": [],
+        },
+    )
+    tool = _tool(
+        feature_type="model_shoot_generate_model", model_id="openai/gpt-image-2.5/flare/text-to-image",
+        ai_steps={"generation_defaults": MODEL_SHOOT_GENERATE_MODEL_GENERATION_DEFAULTS},
+    )
+    db = _worker_db(job, tool)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    monkeypatch.setattr(
+        worker, "TOOL_HANDLERS",
+        {"model_shoot_generate_model": MagicMock(return_value="A studio portrait.")},
+    )
+    submit = MagicMock(return_value="fal-req-2")
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    sent_params = submit.call_args.args[1]  # the ACTUAL outgoing fal payload, not just that the call didn't error
+    assert sent_params["quality"] == "low"
+    assert sent_params["image_size"] == {"width": 1024, "height": 1024}
+    assert sent_params["prompt"] == "A studio portrait."
+
+
+def test_model_shoot_generate_models_prompt_wins_if_it_ever_collided_with_a_generation_default_key(monkeypatch):
+    """generation_defaults is merged in UNDER params, never over it -- prompt
+    (and any future build_instruction-derived key) must always win."""
+    job = MagicMock(
+        id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+        feature_type="model_shoot_generate_model", credits_charged=2,
+        credits_from_subscription=2, credits_from_topup=0,
+        input_params={"image_urls": []},
+    )
+    tool = _tool(
+        feature_type="model_shoot_generate_model", model_id="openai/gpt-image-2.5/flare/text-to-image",
+        ai_steps={"generation_defaults": {"prompt": "should never win", "quality": "low"}},
+    )
+    db = _worker_db(job, tool)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "TOOL_HANDLERS", {"model_shoot_generate_model": MagicMock(return_value="real prompt")})
+    submit = MagicMock(return_value="fal-req-3")
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    sent_params = submit.call_args.args[1]
+    assert sent_params["prompt"] == "real prompt"
+    assert sent_params["quality"] == "low"
+
+
+# --------------------------------------------------------------------------- #
+# model_shoot: real bug fixed -- worker.py used to derive image_size from a
+# stale aspect-ratio-only preset table (MODEL_SHOOT_ASPECT_RATIO_TO_IMAGE_SIZE),
+# which silently ignored "resolution" entirely (every resolution for a given
+# aspect ratio got the exact same fixed size). Now uses model_shoot.
+# resolve_generation_params, off the real ai_steps.size_map, same pattern as
+# listing_photoshoot/creative_photoshoot. model_shoot has no build_instruction
+# step (per-job prompt is baked in at job-creation time via per_job_overrides),
+# so it goes through the same "else: params = dict(job.input_params)" path as
+# listing_photoshoot.
+# --------------------------------------------------------------------------- #
+
+MODEL_SHOOT_SIZE_MAP = {
+    "1:1": {"1k": {"width": 1920, "height": 1920}, "2k": {"width": 3008, "height": 3008}, "4k": {"width": 4096, "height": 4096}},
+    "3:4": {"1k": {"width": 1920, "height": 2560}, "2k": {"width": 2496, "height": 3328}, "4k": {"width": 3072, "height": 4096}},
+    "16:9": {"1k": {"width": 3413, "height": 1920}, "2k": {"width": 3755, "height": 2112}, "4k": {"width": 4096, "height": 2304}},
+}
+MODEL_SHOOT_RESOLUTION_CREDIT = {"1k": 4, "2k": 6, "4k": 8}
+
+
+@pytest.mark.parametrize("aspect_ratio,resolution", [
+    ("1:1", "1k"), ("3:4", "2k"), ("16:9", "4k"),
+])
+def test_model_shoots_real_image_size_reaches_the_real_fal_payload_for_its_own_resolution(
+    monkeypatch, aspect_ratio, resolution,
+):
+    """Confirms the actual outgoing fal payload's image_size matches
+    ai_steps.size_map[aspect_ratio][resolution] exactly -- not the same fixed
+    size regardless of which resolution was picked, which is what the old
+    stale table did."""
+    job = MagicMock(
+        id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+        feature_type="model_shoot", credits_charged=6,
+        credits_from_subscription=6, credits_from_topup=0,
+        input_params={
+            "prompt": "A pose prompt already planned via per_job_overrides.",
+            "aspect_ratio": aspect_ratio, "resolution": resolution,
+            "model_image": "https://fal.test/model.png",
+            "garments": [
+                {"label": "Top", "image_urls": ["https://fal.test/shirt-front.png", "https://fal.test/shirt-back.png"]},
+                {"label": "Bottom", "image_urls": ["https://fal.test/pants.png"]},
+            ],
+            "reference_images": [],
+        },
+    )
+    tool = _tool(
+        feature_type="model_shoot", model_id="fal-ai/bytedance/seedream/v4.5/edit",
+        ai_steps={"size_map": MODEL_SHOOT_SIZE_MAP, "resolution_credit": MODEL_SHOOT_RESOLUTION_CREDIT},
+    )
+    tool.default_output_count = 4
+    db = _worker_db(job, tool)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "TOOL_HANDLERS", {})  # model_shoot has no build_instruction step
+    submit = MagicMock(return_value="fal-req-model-shoot")
+    monkeypatch.setattr(worker, "submit_to_fal", submit)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: True)
+    monkeypatch.setattr(worker, "release_fal_slot", MagicMock())
+
+    _run(worker.submit_generation_to_fal({}, str(job.id)))
+
+    assert job.status == "processing"
+    sent_params = submit.call_args.args[1]  # the ACTUAL outgoing fal payload
+    assert sent_params["image_size"] == MODEL_SHOOT_SIZE_MAP[aspect_ratio][resolution]
+    assert sent_params["prompt"] == "A pose prompt already planned via per_job_overrides."
+    # Groups flatten in order, images within a group stay in order -- this is
+    # the SAME order plan_model_shoot used to label them for the vision call.
+    assert sent_params["image_urls"] == [
+        "https://fal.test/model.png",
+        "https://fal.test/shirt-front.png", "https://fal.test/shirt-back.png",
+        "https://fal.test/pants.png",
+    ]
+    assert "aspect_ratio" not in sent_params
+    assert "resolution" not in sent_params
+    assert "model_image" not in sent_params
+    assert "garments" not in sent_params
+    assert "reference_images" not in sent_params
+
+
 def test_duplicate_run_after_failure_does_not_double_refund(monkeypatch):
     job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
                      feature_type="test_tool", credits_charged=5,
@@ -353,14 +554,25 @@ def test_unknown_tool_is_a_safe_noop_not_a_crash(monkeypatch):
 # global caps against actual Redis.
 # --------------------------------------------------------------------------- #
 
+def _job_created(seconds_ago: float, **overrides):
+    now = datetime.now(timezone.utc)
+    defaults = dict(
+        id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
+        feature_type="test_tool", credits_charged=5,
+        credits_from_subscription=3, credits_from_topup=2, input_params={},
+        created_at=now - timedelta(seconds=seconds_ago),
+    )
+    defaults.update(overrides)
+    return MagicMock(**defaults)
+
+
 def test_submit_re_enqueues_instead_of_submitting_when_at_capacity(monkeypatch):
     """try_reserve_fal_slot() returning False means fal is at capacity right
     now -- the job must be deferred back onto the queue, NOT sent to fal.ai,
     and it must stay 'queued' (not touched) so a later attempt can pick it up
-    cleanly."""
-    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
-                     feature_type="test_tool", credits_charged=5,
-                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+    cleanly. Freshly created (elapsed ~0s) -> still inside the fast-poll
+    window, so the defer stays at 5s."""
+    job = _job_created(seconds_ago=0)
     db = _worker_db(job, _tool())
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)
@@ -382,20 +594,19 @@ def test_submit_re_enqueues_instead_of_submitting_when_at_capacity(monkeypatch):
 
     submit.assert_not_called()      # never sent to fal.ai while at capacity
     assert job.status == "queued"   # left alone for the deferred retry to pick up
-    enqueue.assert_called_once_with("submit_generation_to_fal", str(job.id), 2, _defer_by=5)  # attempt incremented
+    enqueue.assert_called_once_with("submit_generation_to_fal", str(job.id), 2, _defer_by=5)  # attempt incremented, fast poll
 
 
-def test_capacity_retry_gives_up_cleanly_after_the_hard_cap_instead_of_looping_forever(monkeypatch):
+def test_capacity_retry_gives_up_cleanly_after_the_wall_clock_deadline_instead_of_looping_forever(monkeypatch):
     """Regression test: a real incident where a worker sent many repeated
     requests while investigating this exact loop. pool.enqueue_job() starts a
     brand-new arq job every time (its own try counter reset to 1), so arq's
-    own max_tries never bounds this -- without this explicit attempt cap, a
-    permanently-stuck fal concurrency counter would retry every 5s forever.
-    This proves the cap actually stops it: refunded, failed, lock released,
-    NOT re-enqueued again."""
-    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
-                     feature_type="test_tool", credits_charged=5,
-                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+    own max_tries never bounds this -- without this explicit deadline, a
+    permanently-stuck fal concurrency counter would retry forever. This
+    proves the deadline actually stops it: refunded, failed, lock released,
+    NOT re-enqueued again -- once genuinely past SLOT_ACQUISITION_DEADLINE_
+    SECONDS of real wall-clock waiting, not just after N attempts."""
+    job = _job_created(seconds_ago=worker.SLOT_ACQUISITION_DEADLINE_SECONDS + 1)
     db = _worker_db(job, _tool())
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)  # still at capacity
@@ -404,10 +615,9 @@ def test_capacity_retry_gives_up_cleanly_after_the_hard_cap_instead_of_looping_f
     monkeypatch.setattr(worker, "refund_credits", refund)
     monkeypatch.setattr(worker, "release_generation_lock", release)
 
-    enqueue = MagicMock()
     monkeypatch.setattr(worker, "get_arq_pool", MagicMock())  # must never even be reached
 
-    _run(worker.submit_generation_to_fal({}, str(job.id), attempt=worker.MAX_CAPACITY_RETRIES))
+    _run(worker.submit_generation_to_fal({}, str(job.id), attempt=200))
 
     worker.get_arq_pool.assert_not_called()  # gave up instead of scheduling yet another retry
     assert job.status == "failed"
@@ -416,10 +626,12 @@ def test_capacity_retry_gives_up_cleanly_after_the_hard_cap_instead_of_looping_f
     release.assert_called_once_with(job.user_id)
 
 
-def test_capacity_retry_stays_under_the_cap_keeps_retrying(monkeypatch):
-    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
-                     feature_type="test_tool", credits_charged=5,
-                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+def test_capacity_retry_stays_under_the_deadline_keeps_retrying_on_the_slow_poll(monkeypatch):
+    """Still inside the deadline (1s of margin left) -- must keep retrying,
+    not refund. Also confirms the backoff actually switched to the slow 20s
+    poll once past the first minute, instead of hammering Redis with a check
+    every 5s for the whole multi-minute wait."""
+    job = _job_created(seconds_ago=worker.SLOT_ACQUISITION_DEADLINE_SECONDS - 1)
     db = _worker_db(job, _tool())
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)
@@ -437,13 +649,47 @@ def test_capacity_retry_stays_under_the_cap_keeps_retrying(monkeypatch):
         return fake_pool
     monkeypatch.setattr(worker, "get_arq_pool", fake_get_arq_pool)
 
-    _run(worker.submit_generation_to_fal({}, str(job.id), attempt=worker.MAX_CAPACITY_RETRIES - 1))
+    _run(worker.submit_generation_to_fal({}, str(job.id), attempt=200))
 
-    enqueue.assert_called_once_with(
-        "submit_generation_to_fal", str(job.id), worker.MAX_CAPACITY_RETRIES, _defer_by=5,
-    )
+    enqueue.assert_called_once_with("submit_generation_to_fal", str(job.id), 201, _defer_by=20)  # slow poll
     assert job.status == "queued"
     refund.assert_not_called()
+
+
+def test_job_surviving_past_the_old_60s_budget_now_succeeds_instead_of_failing(monkeypatch):
+    """Direct reproduction of the bug as it existed before this fix: under
+    the OLD logic (MAX_CAPACITY_RETRIES=12 * a flat 5s defer =~ 60s), a job
+    still waiting for a slot at attempt 13 / ~61s elapsed would have hit
+    `attempt >= MAX_CAPACITY_RETRIES` and been failed+refunded right here --
+    that generic message, and fal never even touched. Under the new
+    wall-clock deadline (900-1200s depending on fal_per_team_concurrency_
+    limit), the exact same state must instead keep waiting."""
+    job = _job_created(seconds_ago=61)
+    db = _worker_db(job, _tool())
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)  # still at capacity
+    refund = MagicMock()
+    monkeypatch.setattr(worker, "refund_credits", refund)
+
+    enqueue = MagicMock()
+    fake_pool = MagicMock()
+
+    async def fake_call(*a, **k):
+        return enqueue(*a, **k)
+    fake_pool.enqueue_job = fake_call
+
+    async def fake_get_arq_pool():
+        return fake_pool
+    monkeypatch.setattr(worker, "get_arq_pool", fake_get_arq_pool)
+
+    # attempt=13 is exactly what the OLD 5s-fixed-cadence would have reached
+    # by ~61s elapsed (12 retries * 5s) -- old code: attempt(13) >= MAX_
+    # CAPACITY_RETRIES(12) -> fail_cleanly. New code must not fail here.
+    _run(worker.submit_generation_to_fal({}, str(job.id), attempt=13))
+
+    assert job.status == "queued"    # NOT failed -- this is the fix
+    refund.assert_not_called()       # credits never touched
+    enqueue.assert_called_once_with("submit_generation_to_fal", str(job.id), 14, _defer_by=20)
 
 
 def test_try_reserve_fal_slot_raising_fails_the_job_cleanly_not_stuck_forever(monkeypatch):
@@ -482,9 +728,7 @@ def test_try_reserve_fal_slot_raising_fails_the_job_cleanly_not_stuck_forever(mo
 def test_re_enqueue_failure_during_capacity_retry_fails_the_job_cleanly(monkeypatch):
     """If even scheduling the deferred retry blows up (arq pool unreachable),
     the job must still end up cleanly failed+refunded, not silently stuck."""
-    job = MagicMock(id=uuid.uuid4(), status="queued", user_id=uuid.uuid4(), team_id=uuid.uuid4(),
-                     feature_type="test_tool", credits_charged=5,
-                     credits_from_subscription=3, credits_from_topup=2, input_params={})
+    job = _job_created(seconds_ago=0)
     db = _worker_db(job, _tool())
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(worker, "try_reserve_fal_slot", lambda team_id: False)
@@ -542,13 +786,13 @@ def test_fal_slot_reservation_no_longer_gates_on_the_global_account_wide_cap(mon
     account-wide concurrency limit must no longer be pre-checked/rejected on
     our side -- fal's own documented behavior already queues and dispatches
     automatically once that's hit. Proven here by reserving one slot each for
-    more distinct teams than the old global cap (fal_concurrency_limit)
-    allowed, each comfortably under its OWN per-team cap -- every single one
-    must still succeed."""
-    from app.core.config import settings
+    a generous number of distinct teams (the old global cap config,
+    fal_concurrency_limit, is gone entirely now -- there's no config value
+    left to size this against), each comfortably under its OWN per-team cap
+    -- every single one must still succeed."""
     from app.services.generation_lock import try_reserve_fal_slot, release_fal_slot
 
-    num_teams = settings.fal_concurrency_limit + 5
+    num_teams = 20
     reserved = []
     try:
         for _ in range(num_teams):

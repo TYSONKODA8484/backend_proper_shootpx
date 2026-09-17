@@ -16,9 +16,10 @@ from app.models.billing_transaction import BillingTransaction
 from app.models.tool import Tool
 from app.models.tool_definition import ToolDefinition
 from app.models.generation_job import GenerationJob
+from app.models.model_preset import ModelPreset
 
 __all__ = [
     "User", "Team", "TeamMember", "TeamInvite", "TeamSubscription",
     "Subscription", "Credit", "BillingTransaction", "Tool", "ToolDefinition",
-    "GenerationJob",
+    "GenerationJob", "ModelPreset",
 ]

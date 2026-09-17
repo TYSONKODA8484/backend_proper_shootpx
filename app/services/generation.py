@@ -1,15 +1,19 @@
 import logging
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from sqlalchemy.orm import Session
 
 from app.models.generation_job import GenerationJob
 from app.services.tool_definitions import get_tool_definition
 from app.services.generation_lock import (
     acquire_generation_lock, release_generation_lock, release_fal_slot, generation_lock_age_seconds,
+    extend_generation_lock_ttl,
 )
-from app.services.credits import spend_credits, refund_credits
+from app.services.credits import spend_credits_up_to, refund_credits
 from app.core.storage import upload_to_storage, download_from_url
+from app.tools.creative_photoshoot import resolve_generation_params
+from app.tools import listing_planner, model_shoot
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +34,18 @@ TIMEOUT_FAILURE_MESSAGES = {TIMEOUT_MESSAGE, SWEEP_TIMEOUT_MESSAGE}
 def validate_input_params(param_schema: list, input_params: dict) -> None:
     for field in param_schema:
         name = field["name"]
+
+        # output_count is a batch-size control, not a per-job input -- the
+        # route resolves it from its own dedicated Form field (falling back
+        # to tool.default_output_count) and it's never part of the
+        # input_params dict passed here. A param_schema row for it (e.g.
+        # listing_photoshoot's, with its own min/max/default) exists only so
+        # the frontend can render a bounded number input -- it must not be
+        # checked as a "required" per-job field, or every request would fail
+        # with "Missing required field" regardless of what the caller sends.
+        if name == "output_count":
+            continue
+
         value = input_params.get(name)
 
         if field.get("required") and not value:
@@ -45,8 +61,47 @@ def validate_input_params(param_schema: list, input_params: dict) -> None:
                 raise ValueError(f"Invalid value for {field['label']}: {value}")
 
 
-def _resolve_credit_cost(param_schema: list, input_params: dict, fallback_cost: int) -> int:
-    for field in param_schema:
+def _resolve_credit_cost(tool, feature_type: str, input_params: dict, output_count: int) -> int:
+    # creative_photoshoot's cost isn't a flat per-option price on param_schema
+    # (its select options are plain strings, not {value, credit_cost} dicts)
+    # -- it's quality_multiplier * resolution_multiplier off ai_steps, and the
+    # exact width/height combo must be in ai_steps.size_map or this raises.
+    # No GenerationJob row exists yet at this point, so resolve_generation_params
+    # (which only reads job.input_params/job.id) is given a minimal stand-in.
+    if feature_type == "creative_photoshoot":
+        stub_job = SimpleNamespace(id="pending", input_params=input_params)
+        return resolve_generation_params(stub_job, tool)["credit_cost"]
+
+    if feature_type == "listing_photoshoot":
+        # listing_planner.resolve_generation_params prices the WHOLE batch
+        # (quality_multiplier * resolution_multiplier * output_count, one
+        # priced unit per shot) -- output_count isn't part of input_params
+        # (it's create_generation_batch's own already-resolved argument), so
+        # it's added onto the stand-in job's input_params here. Divide the
+        # total back down to a per-job cost: this function's only contract
+        # with its caller is "the price of ONE output", so create_generation_
+        # batch's own `per_output_cost * output_count` reconstructs the exact
+        # same total (exact division -- output_count is a multiplied-in
+        # factor here, never a remainder).
+        stub_job = SimpleNamespace(
+            id="pending", input_params={**input_params, "output_count": output_count},
+        )
+        total_cost = listing_planner.resolve_generation_params(stub_job, tool)["credit_cost"]
+        return total_cost // output_count
+
+    if feature_type == "model_shoot":
+        # Same shape as listing_photoshoot just above: model_shoot.
+        # resolve_generation_params prices the WHOLE batch (resolution_credit
+        # * output_count, one priced unit per pose) -- output_count isn't
+        # part of input_params, so it's added onto the stand-in job here, and
+        # the total is divided back down to a per-job cost.
+        stub_job = SimpleNamespace(
+            id="pending", input_params={**input_params, "output_count": output_count},
+        )
+        total_cost = model_shoot.resolve_generation_params(stub_job, tool)["credit_cost"]
+        return total_cost // output_count
+
+    for field in tool.param_schema:
         if field["type"] != "select":
             continue
         options = field.get("options", [])
@@ -60,7 +115,7 @@ def _resolve_credit_cost(param_schema: list, input_params: dict, fallback_cost: 
             if opt["value"] == selected_value:
                 return opt["credit_cost"]
 
-    return fallback_cost
+    return tool.credit_cost_per_output
 
 
 # How old an unclaimed lock has to be before we'll consider it orphaned
@@ -142,6 +197,14 @@ def create_generation_batch(
         if not tool.is_active:
             raise ValueError("This tool is not currently available")
 
+        # The lock (freshly acquired above, or already held by a caller like
+        # listing_photoshoot/model_shoot's own pre-planning acquire) starts
+        # with the generic LOCK_TTL_SECONDS safety net -- now that the real
+        # tool is known, re-derive its TTL from that tool's own
+        # generation_timeout_seconds so a slow-but-legitimate job never
+        # outlives its own lock (see generation_lock.py).
+        extend_generation_lock_ttl(user_id, tool.generation_timeout_seconds)
+
         validate_input_params(tool.param_schema, input_params)
 
         if per_job_overrides:
@@ -155,10 +218,31 @@ def create_generation_batch(
                 f"(resolved to {output_count!r} for feature_type={feature_type!r})"
             )
 
-        per_output_cost = _resolve_credit_cost(tool.param_schema, input_params, tool.credit_cost_per_output)
-        total_cost = per_output_cost * output_count
+        per_output_cost = _resolve_credit_cost(tool, feature_type, input_params, output_count)
 
-        _, from_subscription, from_topup = spend_credits(db, team_id, total_cost, commit=False)
+        # spend_credits_up_to (not the plain all-or-nothing spend_credits)
+        # because this is a shared TEAM balance: another request against the
+        # same team can spend concurrently between whenever the caller last
+        # saw the balance and this call, so a multi-output batch is sized
+        # down to whatever the team can actually afford right now rather
+        # than rejecting the whole request outright. A single-output request
+        # (output_count=1) behaves identically to spend_credits either way --
+        # either that one unit is affordable or this raises the same
+        # "Insufficient credits" error.
+        _, granted_count, from_subscription, from_topup = spend_credits_up_to(
+            db, team_id, per_output_cost, output_count, commit=False,
+        )
+
+        if granted_count < output_count:
+            logger.info(
+                "team %s: requested %d x %d-credit output(s) for %s but could only "
+                "afford %d right now -- granting a partial batch instead of "
+                "rejecting the whole request",
+                team_id, output_count, per_output_cost, feature_type, granted_count,
+            )
+            output_count = granted_count
+            if per_job_overrides:
+                per_job_overrides = per_job_overrides[:output_count]
 
         per_job_sub = from_subscription // output_count
         per_job_top = from_topup // output_count

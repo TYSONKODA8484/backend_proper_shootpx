@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -89,10 +90,14 @@ def owner_count(db: Session, team_id) -> int:
 
 
 def team_seat_count(db: Session, team_id) -> int:
-    """Current members + still-pending invites."""
+    """Current members + still-pending, not-yet-expired invites."""
     pending = (
         db.query(TeamInvite)
-        .filter(TeamInvite.team_id == team_id, TeamInvite.status == "pending")
+        .filter(
+            TeamInvite.team_id == team_id,
+            TeamInvite.status == "pending",
+            TeamInvite.expires_at > datetime.now(timezone.utc),
+        )
         .count()
     )
     return team_member_count(db, team_id) + pending

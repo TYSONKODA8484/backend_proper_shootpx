@@ -32,6 +32,55 @@ Open:
 - http://localhost:8000/landing/billing
 - http://localhost:8000/landing/tools
 
+## Background worker (arq)
+
+[arq](https://arq-docs.helpmanual.io/) is a Redis-backed async task queue for
+Python. This backend uses it to run everything that shouldn't block an HTTP
+request: submitting a generation job to fal.ai, sweeping/timing-out stuck
+jobs, refilling subscription credits, and reconciling fal concurrency
+counters. `POST /generate` just enqueues a job and returns immediately — the
+actual work happens in a **separate process** (the arq worker), which is why
+it has to be started on its own, alongside `uvicorn`, not instead of it.
+
+`app/worker.py` defines the jobs (`WorkerSettings.functions`) and the cron
+schedule (`WorkerSettings.cron_jobs`):
+
+| Job | Trigger |
+|-----|---------|
+| `submit_generation_to_fal` | enqueued by `POST /generate` (one per job) |
+| `sweep_stale_generation_jobs` | cron, every 15 min |
+| `check_generation_timeouts` | cron, every 15 sec |
+| `reconcile_fal_slots` | cron, every 10 min |
+| `refill_due_subscriptions` | cron, daily at 03:00 |
+| `cleanup_stale_pending_subscriptions` | cron, daily at 04:00 |
+
+**Run it** (same `.env` as the API — it reads settings through
+`app.core.config`, so nothing extra to configure beyond what's already there):
+
+```bash
+arq app.worker.WorkerSettings
+```
+
+Run this in its own terminal, alongside `uvicorn app.main:app --reload` — both
+need to be running for generation jobs to actually complete (the API enqueues,
+the worker executes). Add `--watch app` to auto-restart it on code changes,
+same idea as uvicorn's `--reload`:
+
+```bash
+arq app.worker.WorkerSettings --watch app
+```
+
+- Needs `REDIS_URL` reachable (same Redis as caching/rate-limiting — arq uses
+  it as the job queue, not just a cache here).
+- Needs `FAL_KEY` and `PUBLIC_BACKEND_URL` set — `submit_generation_to_fal`
+  calls fal.ai and gives it a webhook URL (`PUBLIC_BACKEND_URL/webhooks/fal`)
+  to call back on completion. Locally, fal.ai can't reach `localhost`, so
+  webhook delivery only works with a publicly reachable `PUBLIC_BACKEND_URL`
+  (e.g. an ngrok tunnel) — without one, jobs still submit but rely on the
+  worker's own polling fallback (`check_generation_timeouts`) to eventually
+  notice completion instead of getting the webhook immediately.
+- Stop with `Ctrl+C` — `WorkerSettings.on_shutdown` logs a clean shutdown.
+
 ## Cache
 
 `GET /landing/billing` and `GET /landing/tools` are cached in Redis for 1 hour
@@ -166,6 +215,12 @@ No silent defaults — if a variable is missing or invalid, the app refuses to s
 | `RAZORPAY_KEY_ID` | `rzp_test_xxx` | Razorpay API key id (test or live) |
 | `RAZORPAY_KEY_SECRET` | `xxx` | Razorpay API key secret |
 | `RAZORPAY_WEBHOOK_SECRET` | `xxx` | Secret configured on the Razorpay webhook — verifies `POST /billing/webhook` signatures |
+| `FAL_KEY` | `xxx` | fal.ai API key — the arq worker calls fal.ai's generation models with it |
+| `PUBLIC_BACKEND_URL` | `https://api.shootpx.com` | Publicly reachable base URL fal.ai's webhook calls back to (`{PUBLIC_BACKEND_URL}/webhooks/fal`) — needs a tunnel (e.g. ngrok) to work locally |
+| `SUPABASE_URL` | `https://xxx.supabase.co` | Supabase project URL — used for storing generated output images |
+| `SUPABASE_SERVICE_ROLE_KEY` | `xxx` | Supabase service role key (storage uploads) |
+| `FAL_CONCURRENCY_LIMIT` | `10` | Max fal.ai jobs in flight account-wide at once |
+| `FAL_PER_TEAM_CONCURRENCY_LIMIT` | `2` | Max fal.ai jobs in flight per team at once |
 
 ## Structure
 

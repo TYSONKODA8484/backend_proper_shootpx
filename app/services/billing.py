@@ -91,6 +91,11 @@ def create_subscription_checkout(db: Session, team_id, subscription_id) -> dict:
     row.credits_per_refill = 0
     row.next_refill_at = now
     row.current_period_end = now
+    # A fresh lifecycle needs its own renewal notice -- without resetting
+    # this, a team resubscribing after a yearly plan completed (see
+    # worker.py's send_yearly_renewal_notices) would carry over the OLD
+    # cycle's sent_at and never get warned before the new cycle also ends.
+    row.renewal_notice_sent_at = None
 
     try:
         db.flush()

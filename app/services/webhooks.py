@@ -31,6 +31,45 @@ def verify_webhook_signature(payload: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+def send_renewal_notice_email(db: Session, team_sub: TeamSubscription) -> None:
+    """
+    Best-effort courtesy email warning a team's owner that their subscription
+    is about to complete. Shared by handle_subscription_charged's own
+    paid_count-based trigger (weekly/monthly plans -- fires one cycle before
+    total_count is reached) and worker.py's send_yearly_renewal_notices cron
+    (yearly plans -- fires a fixed number of days before current_period_end,
+    since a yearly plan has no intermediate "charged" webhook to key off).
+
+    Never raises: an SMTP failure here must not fail the caller's own
+    transaction (a webhook that otherwise succeeded, or a scheduled job
+    processing other teams too) -- logged and swallowed instead.
+    """
+    owner_membership = db.query(TeamMember).filter(
+        TeamMember.team_id == team_sub.team_id,
+        TeamMember.role == "owner",
+    ).first()
+    if not owner_membership:
+        return
+    owner = db.query(User).filter(User.id == owner_membership.user_id).first()
+    if not owner:
+        return
+
+    try:
+        send_email(
+            to=owner.email,
+            subject="Your ShootPX plan is ending soon",
+            html=(
+                f"Your current plan will complete after your next billing cycle. "
+                f"Renew to keep your credits flowing: {settings.frontend_url}/billing"
+            ),
+        )
+    except Exception:
+        logger.error(
+            "Failed to send renewal-notice email for team %s (owner %s)",
+            team_sub.team_id, owner.id, exc_info=True,
+        )
+
+
 def handle_payment_captured(db: Session, event: dict) -> None:
     payment = event["payload"]["payment"]["entity"]
     razorpay_payment_id = payment["id"]
@@ -301,41 +340,19 @@ def handle_subscription_charged(db: Session, event: dict) -> None:
             refill_subscription_credits(db, team_sub.team_id, team_sub.credits_per_refill)
 
             # Renewal notice: warn the owner one cycle before this subscription
-            # naturally completes (total_count reached).
+            # naturally completes (total_count reached). Best-effort only --
+            # send_renewal_notice_email never raises, so a failed SMTP send
+            # never surfaces as an unhandled 500 to Razorpay for a webhook
+            # that actually succeeded, and since last_paid_count already
+            # advanced above, a retry would never re-attempt the email anyway.
             if plan.total_count and paid_count == plan.total_count - 1:
-                owner_membership = db.query(TeamMember).filter(
-                    TeamMember.team_id == team_sub.team_id,
-                    TeamMember.role == "owner",
-                ).first()
-                if owner_membership:
-                    owner = db.query(User).filter(User.id == owner_membership.user_id).first()
-                    if owner:
-                        # Best-effort only: this is a courtesy notice, not part
-                        # of the billing state transition above (already
-                        # staged, about to commit). If SMTP is down, the email
-                        # is lost -- log it and move on rather than let it
-                        # raise, which would otherwise surface as an unhandled
-                        # 500 to Razorpay for a webhook that actually
-                        # succeeded, and since last_paid_count already
-                        # advanced, a retry would never re-attempt the email.
-                        try:
-                            send_email(
-                                to=owner.email,
-                                subject="Your ShootPX plan is ending soon",
-                                html=(
-                                    f"Your current plan will complete after your next billing cycle. "
-                                    f"Renew to keep your credits flowing: {settings.frontend_url}/billing"
-                                ),
-                            )
-                        except Exception:
-                            logger.error(
-                                "Failed to send renewal-notice email for team %s (owner %s) -- "
-                                "not retried, since last_paid_count already advances past this point.",
-                                team_sub.team_id, owner.id, exc_info=True,
-                            )
-    # Yearly plans: a renewal charge only extends current_period_end. The 12
-    # monthly slices between once-a-year charges are delivered by the daily
-    # refill_due_subscriptions scheduler in worker.py.
+                send_renewal_notice_email(db, team_sub)
+    # Yearly plans: a renewal charge only extends current_period_end -- the 12
+    # monthly credit slices between once-a-year charges are delivered by the
+    # daily refill_due_subscriptions scheduler in worker.py, and the renewal
+    # notice for a yearly plan is sent by that same worker's
+    # send_yearly_renewal_notices cron (keyed off current_period_end
+    # directly, since there's no second "charged" webhook to key off).
 
     db.commit()
 

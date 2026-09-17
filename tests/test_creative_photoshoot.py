@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.tools import creative_photoshoot
+from tests.prompt_fixtures import ai_steps_for
 
 
 def _job(idea=None, prompt=None, image_urls=None):
@@ -18,15 +19,11 @@ def _job(idea=None, prompt=None, image_urls=None):
 
 
 def _tool_definition(ai_steps=None):
-    return MagicMock(ai_steps=ai_steps if ai_steps is not None else {})
+    """Defaults to a fully-migrated row -- all prompt text comes from ai_steps."""
+    return MagicMock(ai_steps=ai_steps if ai_steps is not None else ai_steps_for("creative_photoshoot"))
 
 
-SCENE_VISION_STEP = {
-    "model": "google/gemini-2.5-flash",
-    "model_id": "openrouter/router/vision",
-    "prompt_template": "Describe this product photo as a creative scene for the following idea: {idea}. "
-                        "Write it as a single, concrete, visual scene description suitable as an image generation prompt.",
-}
+SCENE_VISION_STEP = ai_steps_for("creative_photoshoot")["scene_vision"]
 
 
 # --------------------------------------------------------------------------- #
@@ -38,7 +35,7 @@ def test_prompt_only_returns_the_prompt_untouched_without_any_vision_call(monkey
     monkeypatch.setattr(creative_photoshoot, "call_fal_sync", call_fal_sync)
 
     job = _job(idea=None, prompt="a sneaker floating in zero gravity")
-    tool = _tool_definition(ai_steps={"scene_vision": SCENE_VISION_STEP})
+    tool = _tool_definition()
 
     instruction = creative_photoshoot.build_instruction(job, tool, MagicMock())
 
@@ -55,7 +52,7 @@ def test_idea_only_calls_the_configured_vision_model(monkeypatch):
     monkeypatch.setattr(creative_photoshoot, "call_fal_sync", call_fal_sync)
 
     job = _job(idea="Sci-Fi", prompt=None, image_urls=["https://fal.test/first.png", "https://fal.test/second.png"])
-    tool = _tool_definition(ai_steps={"scene_vision": SCENE_VISION_STEP})
+    tool = _tool_definition()
 
     instruction = creative_photoshoot.build_instruction(job, tool, MagicMock())
 
@@ -81,7 +78,7 @@ def test_idea_and_prompt_appends_the_users_prompt_to_the_vision_query(monkeypatc
     monkeypatch.setattr(creative_photoshoot, "call_fal_sync", call_fal_sync)
 
     job = _job(idea="Luxury", prompt="add gold accents")
-    tool = _tool_definition(ai_steps={"scene_vision": SCENE_VISION_STEP})
+    tool = _tool_definition()
 
     instruction = creative_photoshoot.build_instruction(job, tool, MagicMock())
 
@@ -94,7 +91,7 @@ def test_idea_and_prompt_falls_back_to_idea_plus_prompt_when_vision_gives_no_ans
     monkeypatch.setattr(creative_photoshoot, "call_fal_sync", MagicMock(return_value={}))
 
     job = _job(idea="Luxury", prompt="add gold accents")
-    tool = _tool_definition(ai_steps={"scene_vision": SCENE_VISION_STEP})
+    tool = _tool_definition()
 
     instruction = creative_photoshoot.build_instruction(job, tool, MagicMock())
 
@@ -105,7 +102,7 @@ def test_idea_only_falls_back_to_idea_when_vision_gives_no_answer(monkeypatch):
     monkeypatch.setattr(creative_photoshoot, "call_fal_sync", MagicMock(return_value={}))
 
     job = _job(idea="Sci-Fi", prompt=None)
-    tool = _tool_definition(ai_steps={"scene_vision": SCENE_VISION_STEP})
+    tool = _tool_definition()
 
     instruction = creative_photoshoot.build_instruction(job, tool, MagicMock())
 
@@ -119,7 +116,9 @@ def test_idea_given_skips_the_vision_call_when_no_scene_vision_step_configured(m
     monkeypatch.setattr(creative_photoshoot, "call_fal_sync", call_fal_sync)
 
     job = _job(idea="Sci-Fi", prompt="add fog")
-    tool = _tool_definition(ai_steps={})  # no scene_vision entry
+    tool = _tool_definition(ai_steps={
+        k: v for k, v in ai_steps_for("creative_photoshoot").items() if k != "scene_vision"
+    })  # no scene_vision entry
 
     instruction = creative_photoshoot.build_instruction(job, tool, MagicMock())
 
@@ -133,7 +132,7 @@ def test_idea_given_skips_the_vision_call_when_no_scene_vision_step_configured(m
 
 def test_raises_when_both_idea_and_prompt_are_missing():
     job = _job(idea=None, prompt=None)
-    tool = _tool_definition(ai_steps={"scene_vision": SCENE_VISION_STEP})
+    tool = _tool_definition()
 
     with pytest.raises(ValueError, match="needs at least an idea or a prompt"):
         creative_photoshoot.build_instruction(job, tool, MagicMock())

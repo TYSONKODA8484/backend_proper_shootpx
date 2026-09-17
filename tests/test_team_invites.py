@@ -5,6 +5,7 @@ basic happy/role-update paths around it.
 """
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,16 +16,20 @@ from app.services import team_invites as team_invites_svc
 from app.services.team_invites import InviteEmailRateLimitedError, TeamFullError
 
 
-def _invite(status="pending", email="invitee@test.com", role="editor"):
+def _invite(status="pending", email="invitee@test.com", role="editor", expires_at=None):
     return MagicMock(
         id=uuid.uuid4(), team_id=uuid.uuid4(), email=email, role=role,
         status=status, token="tok-1",
+        expires_at=expires_at or (datetime.now(timezone.utc) + timedelta(days=7)),
     )
 
 
 def _accept_db(invite, existing_member=None, member_count=1):
     db = MagicMock()
-    db.query.return_value.filter.return_value.first.side_effect = [invite, existing_member]
+    # Third entry backs the team-row `with_for_update()` lock taken just
+    # before the seat-count check in the "new member" path (see
+    # accept_invite); its return value is unused, only its presence matters.
+    db.query.return_value.filter.return_value.first.side_effect = [invite, existing_member, MagicMock()]
     db.query.return_value.filter.return_value.count.return_value = member_count
     return db
 
@@ -39,6 +44,23 @@ def test_accept_invite_adds_a_new_member_and_marks_accepted():
     assert invite.status == "accepted"
     db.commit.assert_called_once()
     assert result is invite
+
+
+def test_accept_invite_locks_team_row_before_seat_check_for_new_member():
+    """Regression for the real race: two DIFFERENT invitees accepting at the
+    same moment could both read team_member_count() before either commits,
+    jointly pushing the team past MAX_TEAM_MEMBERS (the unique constraint on
+    (team_id, user_id) only stops the SAME user double-accepting, not two
+    different users overfilling the team). accept_invite must now lock the
+    team row (matching app/services/credits.py's balance-update pattern)
+    before checking the seat count, so a concurrent acceptor is forced to
+    wait and re-read the up-to-date count."""
+    invite = _invite()
+    db = _accept_db(invite, existing_member=None, member_count=1)
+
+    team_invites_svc.accept_invite(db, "tok-1", uuid.uuid4(), invite.email)
+
+    db.query.return_value.filter.return_value.with_for_update.assert_called_once()
 
 
 def test_accept_invite_updates_role_for_an_existing_member():
@@ -94,6 +116,26 @@ def test_accept_invite_rejects_already_used_invite():
 
     with pytest.raises(ValueError, match="already used"):
         team_invites_svc.accept_invite(db, "tok-1", uuid.uuid4(), invite.email)
+
+
+def test_accept_invite_rejects_an_expired_invite():
+    invite = _invite(expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = invite
+
+    with pytest.raises(ValueError, match="expired"):
+        team_invites_svc.accept_invite(db, "tok-1", uuid.uuid4(), invite.email)
+
+    assert invite.status == "pending"  # untouched -- never marked accepted
+
+
+def test_accept_invite_accepts_an_invite_expiring_in_the_future():
+    invite = _invite(expires_at=datetime.now(timezone.utc) + timedelta(seconds=1))
+    db = _accept_db(invite, existing_member=None, member_count=1)
+
+    team_invites_svc.accept_invite(db, "tok-1", uuid.uuid4(), invite.email)
+
+    assert invite.status == "accepted"
 
 
 # --------------------------------------------------------------------------- #
@@ -228,3 +270,68 @@ def test_create_invite_rejects_a_second_call_within_the_cooldown(monkeypatch, _c
         team_invites_svc.create_invite(db_second, uuid.uuid4(), email, uuid.uuid4())
 
     sent.assert_called_once()  # not sent a second time
+
+
+def test_create_invite_sets_an_expiry_on_a_new_invite(monkeypatch, _cleanup_invite_cooldown_key):
+    email = f"invitee-{uuid.uuid4().hex}@test.com"
+    _cleanup_invite_cooldown_key.append(f"invite:cooldown:{email}")
+    db = _create_invite_db(existing_invite=None, member_count=1, pending_count=0)
+    monkeypatch.setattr(team_invites_svc.firebase_auth, "generate_sign_in_with_email_link",
+                         lambda email, settings: "https://sign-in.test/link")
+    monkeypatch.setattr(team_invites_svc, "send_email", MagicMock())
+
+    before = datetime.now(timezone.utc)
+    invite = team_invites_svc.create_invite(db, uuid.uuid4(), email, uuid.uuid4())
+    after = datetime.now(timezone.utc)
+
+    expected_min = before + timedelta(days=team_invites_svc.INVITE_EXPIRY_DAYS)
+    expected_max = after + timedelta(days=team_invites_svc.INVITE_EXPIRY_DAYS)
+    assert expected_min <= invite.expires_at <= expected_max
+
+
+# --------------------------------------------------------------------------- #
+# team_seat_count (app/services/teams.py) -- pending invites reserve a seat,
+# but an expired one must not: confirmed via the actual filter args passed,
+# same pattern as list_pending_invites' own status-filter check above.
+# --------------------------------------------------------------------------- #
+
+def test_team_seat_count_query_excludes_expired_invites():
+    from app.services.teams import team_seat_count
+
+    invite_query = MagicMock()
+    invite_query.filter.return_value.count.return_value = 0
+    member_query = MagicMock()
+    member_query.filter.return_value.count.return_value = 0
+
+    def query(model):
+        return invite_query if getattr(model, "__name__", "") == "TeamInvite" else member_query
+
+    db = MagicMock()
+    db.query.side_effect = query
+
+    team_seat_count(db, uuid.uuid4())
+
+    filter_args = invite_query.filter.call_args.args
+    # One of the filter clauses must be TeamInvite.expires_at > <something> --
+    # confirmed by checking the clause's left-hand column, not a specific
+    # "now" value (which changes every run).
+    assert any(
+        getattr(getattr(a, "left", None), "key", None) == "expires_at" for a in filter_args
+    ), f"expected an expires_at filter clause, got: {filter_args}"
+
+
+def test_create_invite_does_not_create_a_row_when_rate_limited(monkeypatch):
+    """Regression: the cooldown check must run BEFORE a brand-new invite row
+    is committed. It previously ran after, so a throttled request (e.g. the
+    same email already invited to a different team seconds earlier) still
+    left a fresh "pending" invite committed to the DB -- silently burning a
+    team seat -- even though no email was ever sent for it and the caller
+    only ever saw a 429."""
+    db = _create_invite_db(existing_invite=None, member_count=1, pending_count=0)
+    monkeypatch.setattr(team_invites_svc, "acquire_cooldown", lambda *a, **k: False)
+
+    with pytest.raises(InviteEmailRateLimitedError):
+        team_invites_svc.create_invite(db, uuid.uuid4(), "throttled@test.com", uuid.uuid4())
+
+    db.add.assert_not_called()
+    db.commit.assert_not_called()

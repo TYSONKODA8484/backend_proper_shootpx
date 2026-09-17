@@ -16,3 +16,10 @@ class TeamInvite(Base):
     status = Column(Text, nullable=False, default="pending")
     invited_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Set explicitly at creation (app/services/team_invites.py's
+    # INVITE_EXPIRY_DAYS), not a DB default -- expiry is a computed check
+    # (expires_at <= now), never its own status transition, so an invite
+    # past this stays "pending" in the DB but is treated as gone by
+    # create_invite's lookup, team_seat_count, list_pending_invites, and
+    # accept_invite alike.
+    expires_at = Column(DateTime(timezone=True), nullable=False)
