@@ -104,13 +104,21 @@ def test_checkout_ignores_injected_amount_and_credits(checkout_client):
 # webhook
 # --------------------------------------------------------------------------- #
 
-def _make_db(pack, existing_txn=None):
+class FakeTeam:
+    def __init__(self, deleted_at=None):
+        self.deleted_at = deleted_at
+
+
+def _make_db(pack, existing_txn=None, team=None):
     db = MagicMock()
 
     def query(model):
         q = MagicMock()
-        if getattr(model, "__name__", "") == "BillingTransaction":
+        name = getattr(model, "__name__", "")
+        if name == "BillingTransaction":
             q.filter.return_value.first.return_value = existing_txn
+        elif name == "Team":
+            q.filter.return_value.first.return_value = team if team is not None else FakeTeam(deleted_at=None)
         else:  # Credit
             q.filter.return_value.first.return_value = pack
         return q
@@ -171,6 +179,62 @@ def test_webhook_rejects_underpayment(monkeypatch):
     webhooks_svc.handle_payment_captured(db, event)
 
     assert granted == []  # nothing granted on an amount mismatch
+
+
+def test_webhook_holds_credits_for_a_soft_deleted_team(monkeypatch):
+    """A real customer paid real money for this credit pack -- if the team is
+    soft-deleted, the payment must not be silently swallowed OR silently
+    credited to a team the owner can't currently see. It's held (a
+    BillingTransaction row with 0 credits_added and a distinct status) for
+    manual support review/refund, not auto-refunded on this function's own
+    authority."""
+    granted = []
+    monkeypatch.setattr(
+        webhooks_svc, "add_topup_credits",
+        lambda *a, **k: granted.append(a),
+    )
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.order, "fetch",
+        lambda oid: {"amount": PACK_PRICE,
+                     "notes": {"team_id": str(TEAM_ID), "credit_pack_id": str(PACK_ID)}},
+    )
+    from datetime import datetime, timezone
+    deleted_team = FakeTeam(deleted_at=datetime.now(timezone.utc))
+    db = _make_db(FakePack(), team=deleted_team)
+    added_rows = []
+    db.add.side_effect = added_rows.append
+
+    event = _event({}, amount=PACK_PRICE)
+    webhooks_svc.handle_payment_captured(db, event)
+
+    assert granted == []  # credits NOT granted
+
+    from app.models.billing_transaction import BillingTransaction
+    txn = next(r for r in added_rows if isinstance(r, BillingTransaction))
+    assert txn.status == "held_team_deleted"
+    assert txn.credits_added == 0
+    assert txn.amount == PACK_PRICE  # the real amount paid is still recorded, for the refund/review path
+    db.commit.assert_called_once()
+
+
+def test_webhook_grants_normally_for_a_non_deleted_team(monkeypatch):
+    """Confirms the new deleted-team check doesn't false-positive on an
+    ordinary, active team."""
+    granted = []
+    monkeypatch.setattr(
+        webhooks_svc, "add_topup_credits",
+        lambda db, team_id, amount, commit=True: granted.append((team_id, amount)),
+    )
+    monkeypatch.setattr(
+        webhooks_svc.razorpay_client.order, "fetch",
+        lambda oid: {"amount": PACK_PRICE,
+                     "notes": {"team_id": str(TEAM_ID), "credit_pack_id": str(PACK_ID)}},
+    )
+    db = _make_db(FakePack(), team=FakeTeam(deleted_at=None))
+
+    webhooks_svc.handle_payment_captured(db, _event({}, amount=PACK_PRICE))
+
+    assert granted == [(str(TEAM_ID), PACK_CREDITS)]
 
 
 def test_webhook_is_idempotent(monkeypatch):

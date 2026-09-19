@@ -52,3 +52,42 @@ def _disable_tool_definition_cache(monkeypatch):
     lookup here to behave as a permanent cache miss with no writes."""
     monkeypatch.setattr(tool_definitions_svc, "get_cached", lambda key: None)
     monkeypatch.setattr(tool_definitions_svc, "set_cached", lambda key, value, ttl=None: None)
+
+
+class _BlockedSMTP:
+    """Stand-in for smtplib.SMTP that refuses to connect and records the attempt."""
+    attempts: list = []
+
+    def __init__(self, host=None, port=None, *a, **k):
+        _BlockedSMTP.attempts.append((host, port))
+        raise ConnectionRefusedError(
+            "the test suite attempted to open a REAL SMTP connection -- stub "
+            "send_email (or the function that calls it) in this test"
+        )
+
+
+@pytest.fixture(autouse=True)
+def _never_send_real_email(monkeypatch):
+    """Hard guarantee that running the tests can never email a real person.
+
+    Several tests run against the real dev database, whose users are real
+    people with real inboxes, and the app sends genuine email through the
+    configured SMTP account. One such test (a real-DB team delete/restore
+    check) did exactly that -- every suite run emailed real users a
+    "team restored" message. Stubbing send_email in each test is what should
+    happen, but "every test remembers" is precisely how that leaked, so
+    this enforces it: any attempt to open an SMTP connection is refused and
+    then FAILS the test at teardown, even if the calling code swallows the
+    error (notify_team_restored and friends deliberately do), pointing at
+    the test that needs a stub.
+    """
+    from app.core import email as email_module
+
+    _BlockedSMTP.attempts = []
+    monkeypatch.setattr(email_module.smtplib, "SMTP", _BlockedSMTP)
+    yield
+    attempts, _BlockedSMTP.attempts = _BlockedSMTP.attempts, []
+    assert not attempts, (
+        f"this test tried to send real email ({len(attempts)} SMTP connection attempt(s) "
+        f"to {attempts[0][0]}:{attempts[0][1]}) -- stub send_email in it"
+    )

@@ -55,7 +55,7 @@ def test_generate_cleans_up_when_arq_enqueue_fails(gen_client, monkeypatch):
     the per-user lock held, with nothing ever going to process it."""
     client, fake_user, db = gen_client
     monkeypatch.setattr("app.routes.generation.is_team_member", lambda db, tid, uid: True)
-    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=5)
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(max_input_images=5, is_active=True, stage=1)
     monkeypatch.setattr(
         "app.routes.generation.upload_image_to_fal",
         lambda *a, **k: "https://fal.test/uploaded.png",

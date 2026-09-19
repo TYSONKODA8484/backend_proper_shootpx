@@ -73,3 +73,4 @@ def test_submit_to_fal_still_uses_the_full_model_id_including_the_endpoint_segme
     fal_client.submit_to_fal("openai/gpt-image-2/edit", {"prompt": "x"}, "https://backend.test/webhooks/fal")
 
     assert captured["url"] == "https://queue.fal.run/openai/gpt-image-2/edit"
+

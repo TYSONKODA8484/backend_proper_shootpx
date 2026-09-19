@@ -79,6 +79,9 @@ def test_job_exceeding_its_own_tools_timeout_is_failed_and_refunded(monkeypatch)
     monkeypatch.setattr(worker, "refund_credits", refund)
     monkeypatch.setattr(worker, "release_generation_lock", release)
     monkeypatch.setattr(worker, "release_fal_slot", release_slot)
+    # The lock is only released when this was the user's LAST active job; on a
+    # MagicMock db that check would read as a truthy "yes, still active".
+    monkeypatch.setattr(worker.generation_svc, "_user_has_active_generation_job", lambda db_, uid: False)
 
     _run(worker.check_generation_timeouts({}))
 

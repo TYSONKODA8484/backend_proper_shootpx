@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from sqlalchemy.orm import Session
 
@@ -29,6 +29,106 @@ UPLOAD_FAILED_MESSAGE = "Could not save the generated image. Please try again."
 TIMEOUT_MESSAGE = "Generation took too long. Please try again."
 SWEEP_TIMEOUT_MESSAGE = "Generation timed out — no response received"
 TIMEOUT_FAILURE_MESSAGES = {TIMEOUT_MESSAGE, SWEEP_TIMEOUT_MESSAGE}
+
+
+def _job_history_title(job: GenerationJob) -> str:
+    # title is nullable and nothing sets it yet (see list_team_generations) --
+    # this fallback keeps the history list usable in the meantime. Whether
+    # title ends up auto-generated at job-creation time or user-editable
+    # after the fact is a separate, not-yet-decided piece of work.
+    if job.title:
+        return job.title
+    return f"{job.feature_type} — {job.created_at.isoformat()}"
+
+
+PERIOD_PRESETS = {
+    "last_7_days": timedelta(days=7),
+    "last_30_days": timedelta(days=30),
+}
+
+
+def _resolve_period(period: str | None, from_dt, to_dt):
+    """Shared by list_team_generations and usage.get_team_usage.
+    Explicit from_/to_ wins if given; otherwise a named preset resolves to a
+    rolling window ending now; "all_time" (or nothing at all) means no filter."""
+    if from_dt or to_dt:
+        return from_dt, to_dt
+    if period and period in PERIOD_PRESETS:
+        return datetime.now(timezone.utc) - PERIOD_PRESETS[period], None
+    return None, None
+
+
+# What each view of the history hides by default. The two views differ on
+# purpose:
+#   * "recent" (Home's Recent Work strip) shows finished, displayable results
+#     only, so it also hides model_shoot_generate_model -- an internal step of
+#     the Model Shoot flow, not a standalone result to feature on Home.
+#   * "library" is the full paid-history view. model_shoot_generate_model is
+#     something the user paid credits for and a legitimate deliverable, so it
+#     belongs there. Only enhance_prompt is hidden, because it produces text
+#     and never an outputUrl -- there is nothing to ever show.
+# Library also hides `failed` jobs by default (see list_team_generations) --
+# they were refunded and have no image -- while queued/processing stay visible.
+EXCLUDED_BY_VIEW = {
+    "recent": ("enhance_prompt", "model_shoot_generate_model"),
+    "library": ("enhance_prompt",),
+}
+
+
+def list_team_generations(
+    db: Session, team_id, limit: int = 10, offset: int = 0,
+    feature_type: str | None = None, user_id=None,
+    period: str | None = None, from_dt=None, to_dt=None,
+    status: str | None = None, view: str = "recent",
+) -> list[dict]:
+    # One filter() call for the always-on conditions. An explicitly requested
+    # feature_type wins over the view's default exclusion (the exclusion is a
+    # default, not a hard block), so the two are mutually exclusive rather
+    # than stacked.
+    conditions = [GenerationJob.team_id == team_id]
+    if feature_type:
+        conditions.append(GenerationJob.feature_type == feature_type)
+    else:
+        conditions.append(GenerationJob.feature_type.notin_(EXCLUDED_BY_VIEW[view]))
+    query = db.query(GenerationJob).filter(*conditions)
+
+    if status:
+        query = query.filter(GenerationJob.status == status)
+    elif view == "library":
+        # A failed generation is refunded (see fail_and_release/refund_credits),
+        # so there is nothing the user paid for to keep in their paid-history
+        # view -- and a failed card has no image to show. Hidden by default;
+        # an explicit status=failed still returns them. Filtered here, not in
+        # the client, so pages stay full and offsets stay correct.
+        query = query.filter(GenerationJob.status != "failed")
+    if user_id:
+        query = query.filter(GenerationJob.user_id == user_id)
+
+    resolved_from, resolved_to = _resolve_period(period, from_dt, to_dt)
+    if resolved_from:
+        query = query.filter(GenerationJob.created_at >= resolved_from)
+    if resolved_to:
+        query = query.filter(GenerationJob.created_at <= resolved_to)
+
+    jobs = (
+        query.order_by(GenerationJob.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "jobId": str(job.id),
+            "batchId": str(job.batch_id) if job.batch_id else None,
+            "title": _job_history_title(job),
+            "featureType": job.feature_type,
+            "status": job.status,
+            "createdAt": job.created_at.isoformat() if job.created_at else None,
+            "outputUrl": job.output_url,
+            "deeplink": {"type": "page", "route": "library", "params": {"job_id": str(job.id)}},
+        }
+        for job in jobs
+    ]
 
 
 def validate_input_params(param_schema: list, input_params: dict) -> None:
@@ -194,7 +294,12 @@ def create_generation_batch(
         tool = get_tool_definition(db, feature_type)
         if not tool:
             raise ValueError("Unknown tool")
-        if not tool.is_active:
+        # Same condition as GET /tools/{feature_type}/schema's own gate
+        # (stage != 1 or not is_active) -- these two must never disagree, or
+        # a tool mid-launch (is_active flipped true while still at stage 0
+        # for internal testing) would be invisible to the schema endpoint
+        # but generatable anyway.
+        if tool.stage != 1 or not tool.is_active:
             raise ValueError("This tool is not currently available")
 
         # The lock (freshly acquired above, or already held by a caller like

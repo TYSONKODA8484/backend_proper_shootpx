@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.razorpay_client import razorpay_client
 from app.models.billing_transaction import BillingTransaction
 from app.models.credit import Credit
+from app.models.team import Team
 from app.services.credits import add_topup_credits
 from datetime import datetime, timedelta, timezone
 from app.models.team_subscription import TeamSubscription
@@ -131,6 +132,37 @@ def handle_payment_captured(db: Session, event: dict) -> None:
             amount=amount_paid,
             credits_added=0,
             status="amount_mismatch",
+        ))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+        return
+
+    # A real customer paid real money here (Razorpay already captured the
+    # payment) -- if the team it's for is soft-deleted, silently crediting a
+    # team the owner can't currently see/use would leave them thinking their
+    # purchase vanished, with no indication a restore would fix it. HOLD the
+    # grant instead of skipping it outright: the BillingTransaction row (0
+    # credits_added, a distinct status) is the audit trail support needs to
+    # find this and either manually credit it after the team is restored or
+    # process a refund -- this function never auto-refunds on its own
+    # authority, that's a real money-movement decision for a human.
+    team = db.query(Team).filter(Team.id == team_id).first()
+    if team is not None and team.deleted_at is not None:
+        logger.error(
+            "MANUAL FOLLOW-UP NEEDED: payment %s captured for team %s, but that "
+            "team is soft-deleted (deleted_at=%s) -- credits were NOT granted. "
+            "Restore the team then manually credit it, or refund the payment.",
+            razorpay_payment_id, team_id, team.deleted_at,
+        )
+        db.add(BillingTransaction(
+            team_id=team_id,
+            type="credit_pack",
+            razorpay_payment_id=razorpay_payment_id,
+            amount=amount_paid,
+            credits_added=0,
+            status="held_team_deleted",
         ))
         try:
             db.commit()

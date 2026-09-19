@@ -3,17 +3,27 @@ import logging
 import httpx
 
 from app.core.config import settings
+from app.core.http_retry import send_with_retry
 
 logger = logging.getLogger(__name__)
 
 
 def submit_to_fal(model_id: str, input_params: dict, webhook_url: str) -> str:
-    response = httpx.post(
-        f"https://queue.fal.run/{model_id}",
-        params={"fal_webhook": webhook_url},
-        headers={"Authorization": f"Key {settings.fal_key}"},
-        json=input_params,
-        timeout=30,
+    # Retried on transient failures (see app/core/http_retry.py for the rules).
+    # Known trade-off: a READ timeout is ambiguous -- fal may have received and
+    # queued the request but never answered in time, so a retry can queue a
+    # second request for the same job. That costs at most one extra generation
+    # on a rare event, and the duplicate's webhook is ignored (the job is
+    # already resolved) -- far better than failing a healthy job for the user.
+    response = send_with_retry(
+        lambda: httpx.post(
+            f"https://queue.fal.run/{model_id}",
+            params={"fal_webhook": webhook_url},
+            headers={"Authorization": f"Key {settings.fal_key}"},
+            json=input_params,
+            timeout=30,
+        ),
+        "fal.ai submit",
     )
     try:
         response.raise_for_status()
@@ -99,11 +109,18 @@ def call_fal_sync(model_id: str, input_params: dict) -> dict:
     Only use this for calls that genuinely finish in a few seconds; anything
     slower (like the real generation) must use the queue + webhook pattern.
     """
-    response = httpx.post(
-        f"https://fal.run/{model_id}",
-        headers={"Authorization": f"Key {settings.fal_key}"},
-        json=input_params,
-        timeout=30,
+    # Retried on transient failures (app/core/http_retry.py). These are the
+    # vision/planning calls (listing shots, model-shoot analysis, scene and
+    # recolor instructions); a retry after an ambiguous read timeout can at
+    # worst repeat one cheap vision call.
+    response = send_with_retry(
+        lambda: httpx.post(
+            f"https://fal.run/{model_id}",
+            headers={"Authorization": f"Key {settings.fal_key}"},
+            json=input_params,
+            timeout=30,
+        ),
+        "fal.ai sync call",
     )
     try:
         response.raise_for_status()

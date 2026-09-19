@@ -3,6 +3,7 @@ import re
 
 import httpx
 from app.core.config import settings
+from app.core.http_retry import send_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -29,18 +30,29 @@ def upload_to_storage(file_path: str, file_bytes: bytes, content_type: str = "im
     _validate_storage_path(file_path)
     url = f"{settings.supabase_url}/storage/v1/object/{BUCKET_NAME}/{file_path}"
 
-    response = httpx.post(
-        url,
-        # Supabase's newer sb_secret_... keys are not JWTs, so they must go on
-        # the `apikey` header -- `Authorization: Bearer` tries to parse them
-        # as a JWT and fails ("Invalid Compact JWS"). Confirmed live against
-        # this project's real key during this audit.
-        headers={
-            "apikey": settings.supabase_service_role_key,
-            "Content-Type": content_type,
-        },
-        content=file_bytes,
-        timeout=30,
+    # Retried on transient failures (app/core/http_retry.py). A retry after an
+    # ambiguous read timeout may land on an upload that in fact succeeded the
+    # first time; without x-upsert Supabase would answer that with a 400
+    # "Duplicate" (a 4xx, never retried), failing a job whose image is already
+    # safely stored. x-upsert makes the retry an idempotent overwrite. The path
+    # is unique per job (team/feature/job_id), so upsert can only ever replace
+    # this same job's own file.
+    response = send_with_retry(
+        lambda: httpx.post(
+            url,
+            # Supabase's newer sb_secret_... keys are not JWTs, so they must go on
+            # the `apikey` header -- `Authorization: Bearer` tries to parse them
+            # as a JWT and fails ("Invalid Compact JWS"). Confirmed live against
+            # this project's real key during this audit.
+            headers={
+                "apikey": settings.supabase_service_role_key,
+                "Content-Type": content_type,
+                "x-upsert": "true",
+            },
+            content=file_bytes,
+            timeout=30,
+        ),
+        "Supabase storage upload",
     )
     try:
         response.raise_for_status()
@@ -61,7 +73,10 @@ def download_from_url(url: str) -> bytes:
     Downloads a file from any URL (used to fetch fal.ai's output before
     it expires, so we can re-upload it to our own permanent storage).
     """
-    response = httpx.get(url, timeout=30)
+    # Retried on transient failures (app/core/http_retry.py). A plain GET, so a
+    # retry is always safe. A 403/404 (fal's output link expired or was never
+    # valid) is a client error and is NOT retried.
+    response = send_with_retry(lambda: httpx.get(url, timeout=30), "fal.ai output download")
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError:

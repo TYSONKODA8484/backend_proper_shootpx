@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -25,6 +26,7 @@ from app.core.fal_client import upload_image_to_fal
 from app.tools.listing_planner import plan_listing_shots, MAX_OUTPUT_COUNT as LISTING_MAX_OUTPUT_COUNT
 from app.tools.model_shoot import plan_model_shoot
 from app.services.tool_definitions import get_tool_definition
+from app.services.job_errors import public_job_error
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,40 @@ async def _read_and_upload_images(images: List[UploadFile]) -> List[str]:
         upload_image_to_fal(file_bytes, filename, content_type)
         for file_bytes, filename, content_type in read_images
     ]
+
+
+LIBRARY_SOURCE_UNAVAILABLE_MESSAGE = "One or more selected images are not available"
+
+
+def _resolve_source_job_urls(db: Session, team_id, job_ids: list[UUID]) -> dict[UUID, str]:
+    """
+    job id -> that job's output_url, for reusing Library outputs as inputs.
+
+    ONE query for every id across every slot (each extra query is a full
+    network round trip). A job only counts if it belongs to THIS team, is
+    completed, and actually has an output -- anything else (someone else's
+    job, a failed/processing one, an unknown id) fails the whole request with
+    the same generic message, so a caller can't probe which ids exist in other
+    teams. Runs BEFORE any fal upload so a bad selection never costs quota.
+    """
+    unique = set(job_ids)
+    if not unique:
+        return {}
+
+    rows = (
+        db.query(GenerationJob.id, GenerationJob.output_url)
+        .filter(
+            GenerationJob.id.in_(unique),
+            GenerationJob.team_id == team_id,
+            GenerationJob.status == "completed",
+            GenerationJob.output_url.isnot(None),
+        )
+        .all()
+    )
+    found = {job_id: url for job_id, url in rows}
+    if len(found) != len(unique):
+        raise HTTPException(status_code=400, detail=LIBRARY_SOURCE_UNAVAILABLE_MESSAGE)
+    return found
 
 
 class GenerateRequest(BaseModel):
@@ -149,6 +185,23 @@ async def generate(
     # model_shoot; a preset's image_url is already a real hosted URL, so it
     # skips _read_and_upload_images entirely (see below).
     model_preset_id: str = Form(None),
+    # Reuse EXISTING outputs from the team's Library as inputs, instead of
+    # uploading files. These take generation job ids (not raw URLs) on
+    # purpose: each id is resolved server-side to that job's own output_url
+    # and must belong to THIS team, be completed, and have an output -- so a
+    # caller can only ever reference images their own team generated, and
+    # can't make fal fetch an arbitrary URL. Combine freely with uploads.
+    # Generic tools (recolor, creative_photoshoot, listing_photoshoot):
+    source_job_ids: List[UUID] = Form(default=[]),
+    # model_shoot's grouped slots, mirroring the upload fields above one to
+    # one -- the model may come from a past model_shoot_generate_model result:
+    model_source_job_id: UUID | None = Form(None),
+    top_source_job_ids: List[UUID] = Form(default=[]),
+    bottom_source_job_ids: List[UUID] = Form(default=[]),
+    extra_source_job_ids_1: List[UUID] = Form(default=[]),
+    extra_source_job_ids_2: List[UUID] = Form(default=[]),
+    extra_source_job_ids_3: List[UUID] = Form(default=[]),
+    reference_source_job_ids: List[UUID] = Form(default=[]),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -158,22 +211,35 @@ async def generate(
     tool_check = get_tool_definition(db, feature_type)
     if not tool_check:
         raise HTTPException(status_code=400, detail="Unknown tool")
+    # Checked here, first, deliberately BEFORE any image upload happens
+    # below (_read_and_upload_images spends real fal quota per image) --
+    # same reasoning already documented for validate_input_params further
+    # down: a request that's going to be rejected must not cost anything
+    # first. Same condition as GET /tools/{feature_type}/schema's gate and
+    # create_generation_batch's own defense-in-depth check -- all three must
+    # agree, or a tool visible to one and hidden from another is a real gap.
+    if tool_check.stage != 1 or not tool_check.is_active:
+        raise HTTPException(status_code=400, detail="This tool is not currently available")
 
     if feature_type == "model_shoot":
-        if bool(model_image) == bool(model_preset_id):
+        if sum(bool(m) for m in (model_image, model_preset_id, model_source_job_id)) != 1:
             raise HTTPException(
                 status_code=400,
-                detail="Provide exactly one of model_image or model_preset_id",
+                detail="Provide exactly one of model_image, model_preset_id or model_source_job_id",
             )
         # The model reference is always exactly 1 image toward fal's own
-        # image_urls cap, whether it came from an upload or a preset -- a
-        # preset's image_url still ends up in the same final list sent to
+        # image_urls cap, whether it came from an upload, a preset or a past
+        # Library result -- all end up in the same final list sent to
         # fal (see worker.py's model_shoot image recombination), so it
-        # counts the same either way.
+        # counts the same either way. Library-sourced images count too.
         total_input_images = (
-            1 + len(top_images) + len(bottom_images)
-            + len(extra_images_1) + len(extra_images_2) + len(extra_images_3)
-            + len(reference_images)
+            1
+            + len(top_images) + len(top_source_job_ids)
+            + len(bottom_images) + len(bottom_source_job_ids)
+            + len(extra_images_1) + len(extra_source_job_ids_1)
+            + len(extra_images_2) + len(extra_source_job_ids_2)
+            + len(extra_images_3) + len(extra_source_job_ids_3)
+            + len(reference_images) + len(reference_source_job_ids)
         )
         if total_input_images > tool_check.max_input_images:
             raise HTTPException(
@@ -187,7 +253,13 @@ async def generate(
         # longer declares and FastAPI silently drops rather than rejects)
         # must never be allowed to quietly plan+generate a garment-less
         # "model only" shot and still charge credits for it.
-        total_garment_images = len(top_images) + len(bottom_images) + len(extra_images_1) + len(extra_images_2) + len(extra_images_3)
+        total_garment_images = (
+            len(top_images) + len(top_source_job_ids)
+            + len(bottom_images) + len(bottom_source_job_ids)
+            + len(extra_images_1) + len(extra_source_job_ids_1)
+            + len(extra_images_2) + len(extra_source_job_ids_2)
+            + len(extra_images_3) + len(extra_source_job_ids_3)
+        )
         if total_garment_images == 0:
             raise HTTPException(
                 status_code=400,
@@ -196,7 +268,7 @@ async def generate(
                        "the page, an older cached version may still be sending the removed "
                        "garment_images field.",
             )
-    elif len(images) > tool_check.max_input_images:
+    elif len(images) + len(source_job_ids) > tool_check.max_input_images:
         raise HTTPException(
             status_code=400,
             detail=f"This tool accepts at most {tool_check.max_input_images} image(s)",
@@ -244,6 +316,29 @@ async def generate(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # creative_photoshoot's param_schema marks idea and prompt each optional,
+    # but at least one is required (see creative_photoshoot.build_instruction,
+    # which raises without one). That check used to live ONLY in the worker,
+    # so a request with neither was accepted, created a job, reserved credits
+    # and then failed minutes later -- rejected here instead, before any
+    # upload or credit reservation.
+    if feature_type == "creative_photoshoot" and not (idea or "").strip() and not (prompt or "").strip():
+        raise HTTPException(status_code=400, detail="Describe your scene or pick an idea")
+
+    # Resolve every Library-sourced image id in ONE query, before any upload:
+    # a bad selection (another team's job, a failed job, an unknown id) must
+    # be rejected without having spent fal quota on the uploads beside it.
+    if feature_type == "model_shoot":
+        wanted_source_ids = [
+            *([model_source_job_id] if model_source_job_id else []),
+            *top_source_job_ids, *bottom_source_job_ids,
+            *extra_source_job_ids_1, *extra_source_job_ids_2, *extra_source_job_ids_3,
+            *reference_source_job_ids,
+        ]
+    else:
+        wanted_source_ids = list(source_job_ids)
+    source_urls = _resolve_source_job_urls(db, team_id, wanted_source_ids)
+
     if feature_type == "model_shoot":
         if model_preset_id:
             preset = db.query(ModelPreset).filter(ModelPreset.id == model_preset_id).first()
@@ -256,31 +351,51 @@ async def generate(
             # preset was never uploaded as a file in this request, so there's
             # nothing to validate here -- by design, not an oversight.
             model_image_url = preset.image_url
+        elif model_source_job_id:
+            # A past Library output (typically a model_shoot_generate_model
+            # result) -- already a real hosted URL, nothing to upload.
+            model_image_url = source_urls[model_source_job_id]
         else:
             model_image_url = (await _read_and_upload_images([model_image]))[0]
         # Build the grouped garments list -- one entry per non-empty slot, in
         # a fixed Top -> Bottom -> extra-1 -> extra-2 -> extra-3 order (this
         # order is what plan_model_shoot labels images in, and worker.py's
         # real generation call must reproduce it exactly, see
-        # flatten_garment_image_urls).
+        # flatten_garment_image_urls). Within a slot, uploads come first, then
+        # Library-sourced images, in the order they were sent.
         garments = []
-        top_image_urls = await _read_and_upload_images(top_images)
+        top_image_urls = (
+            await _read_and_upload_images(top_images)
+            + [source_urls[j] for j in top_source_job_ids]
+        )
         if top_image_urls:
             garments.append({"label": "Top", "image_urls": top_image_urls})
-        bottom_image_urls = await _read_and_upload_images(bottom_images)
+        bottom_image_urls = (
+            await _read_and_upload_images(bottom_images)
+            + [source_urls[j] for j in bottom_source_job_ids]
+        )
         if bottom_image_urls:
             garments.append({"label": "Bottom", "image_urls": bottom_image_urls})
-        for extra_label, extra_images in (
-            (extra_label_1, extra_images_1),
-            (extra_label_2, extra_images_2),
-            (extra_label_3, extra_images_3),
+        for extra_label, extra_images, extra_source_ids in (
+            (extra_label_1, extra_images_1, extra_source_job_ids_1),
+            (extra_label_2, extra_images_2, extra_source_job_ids_2),
+            (extra_label_3, extra_images_3, extra_source_job_ids_3),
         ):
-            extra_image_urls = await _read_and_upload_images(extra_images)
+            extra_image_urls = (
+                await _read_and_upload_images(extra_images)
+                + [source_urls[j] for j in extra_source_ids]
+            )
             if extra_image_urls:
                 garments.append({"label": extra_label or "Garment", "image_urls": extra_image_urls})
-        reference_image_urls = await _read_and_upload_images(reference_images)
+        reference_image_urls = (
+            await _read_and_upload_images(reference_images)
+            + [source_urls[j] for j in reference_source_job_ids]
+        )
     else:
-        image_urls = await _read_and_upload_images(images)
+        image_urls = (
+            await _read_and_upload_images(images)
+            + [source_urls[j] for j in source_job_ids]
+        )
 
     input_params = {
         "color": color,
@@ -321,7 +436,12 @@ async def generate(
 
             effective_output_count = output_count if output_count and output_count > 0 else tool_check.default_output_count
             try:
-                shots = plan_listing_shots(tool_check, image_urls, prompt, effective_output_count)
+                # Off the event loop: this is a blocking HTTP call that now retries
+                # (up to ~94s worst case). Run inline it would freeze EVERY other
+                # request on this server for that long, not just this one.
+                shots = await asyncio.to_thread(
+                    plan_listing_shots, tool_check, image_urls, prompt, effective_output_count,
+                )
             except Exception:
                 release_generation_lock(user.id)
                 raise HTTPException(status_code=503, detail="Failed to plan listing shots. Please try again.")
@@ -341,7 +461,9 @@ async def generate(
 
             effective_output_count = output_count if output_count and output_count > 0 else tool_check.default_output_count
             try:
-                plan = plan_model_shoot(
+                # Off the event loop, same reason as plan_listing_shots above.
+                plan = await asyncio.to_thread(
+                    plan_model_shoot,
                     tool_check, model_image_url, garments, reference_image_urls,
                     prompt, effective_output_count,
                 )
@@ -436,8 +558,15 @@ def get_job(
         "status": job.status,
         "outputUrl": job.output_url,
         "outputText": job.output_text,
-        "errorMessage": job.error_message,
+        "errorMessage": public_job_error(job.status, job.error_message),
         "creditsCharged": job.credits_charged,
+        # Only ever set for listing_photoshoot today (its shot planner writes
+        # shot_type into input_params as a per_job_override -- see
+        # create_generation_batch). model_shoot has no per-prompt label of
+        # its own (plan_model_shoot returns bare prompt strings, nothing
+        # structured to pull a label from), so this is always null there --
+        # not a bug, there's genuinely nothing to show yet.
+        "shotType": job.input_params.get("shot_type") if job.input_params else None,
     }
 
 
@@ -461,8 +590,11 @@ def get_batch(
         "jobs": [
             {
                 "jobId": str(j.id), "status": j.status, "outputUrl": j.output_url,
-                "outputText": j.output_text, "errorMessage": j.error_message,
+                "outputText": j.output_text, "errorMessage": public_job_error(j.status, j.error_message),
                 "creditsCharged": j.credits_charged,
+                # See the matching comment on GET /jobs/{job_id} -- null for
+                # every tool except listing_photoshoot today.
+                "shotType": j.input_params.get("shot_type") if j.input_params else None,
             }
             for j in jobs
         ],
@@ -480,5 +612,9 @@ async def fal_webhook(request: Request, job_id: UUID, db: Session = Depends(get_
         raise HTTPException(status_code=401, detail=str(e))
 
     payload = json.loads(raw_body)
-    handle_fal_webhook(db, job_id, payload)
+    # Off the event loop: handling a completed job downloads fal's output and
+    # uploads it to our storage -- two blocking HTTP calls that now retry (a
+    # stalled one could hold ~94s each). Inline in this async handler that
+    # would freeze every other request on the server.
+    await asyncio.to_thread(handle_fal_webhook, db, job_id, payload)
     return {"status": "ok"}

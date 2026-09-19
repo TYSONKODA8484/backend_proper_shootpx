@@ -13,13 +13,15 @@ from app.models.team_subscription import TeamSubscription
 from app.models.subscription import Subscription
 from app.models.credit import Credit
 from app.models.billing_transaction import BillingTransaction
-from app.models.tool import Tool
 from app.models.tool_definition import ToolDefinition
 from app.models.generation_job import GenerationJob
 from app.models.model_preset import ModelPreset
+from app.models.homepage_slide import HomepageSlide
+from app.models.signup_bonus_log import SignupBonusLog
 
 __all__ = [
     "User", "Team", "TeamMember", "TeamInvite", "TeamSubscription",
-    "Subscription", "Credit", "BillingTransaction", "Tool", "ToolDefinition",
-    "GenerationJob", "ModelPreset",
+    "Subscription", "Credit", "BillingTransaction", "ToolDefinition",
+    "GenerationJob", "ModelPreset", "HomepageSlide",
+    "SignupBonusLog",
 ]

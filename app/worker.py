@@ -12,6 +12,7 @@ from arq.cron import cron
 from app.core.config import settings
 from app.core.cache import redis_client
 from app.core.database import SessionLocal
+from app.core.watchdog import WorkerWatchdog
 from app.core.fal_client import submit_to_fal, check_fal_status, fetch_fal_result
 from app.core.arq_pool import get_arq_pool
 import app.models  # noqa: F401 -- registers every model on Base.metadata before any query runs (see app/models/__init__.py)
@@ -292,6 +293,32 @@ async def cleanup_stale_pending_subscriptions(ctx):
 
     db.commit()
     db.close()
+
+
+async def purge_expired_deleted_teams(ctx):
+    """
+    The second half of the two-clock team-deletion design (see
+    services/teams.py soft_delete_team/restore_team): a team past its
+    GRACE_PERIOD_DAYS window gets permanently hard-deleted here. Razorpay was
+    already cancelled the moment deletion was requested, not now.
+    """
+    from app.services.teams import list_teams_past_grace_period, purge_team
+
+    db = SessionLocal()
+    try:
+        expired = list_teams_past_grace_period(db)
+        for team in expired:
+            try:
+                logger.info(
+                    "Purging team %s -- deleted_at=%s past the grace window",
+                    team.id, team.deleted_at,
+                )
+                purge_team(db, team.id)
+            except Exception:
+                db.rollback()
+                logger.exception("failed to purge team %s -- will retry next run", team.id)
+    finally:
+        db.close()
 
 
 GENERIC_START_FAILED_MESSAGE = "Failed to start generation. Please try again."
@@ -581,7 +608,16 @@ def _fail_stale_job(db, job_id, message: str) -> bool:
     )
     locked_job.completed_at = datetime.now(timezone.utc)
     db.commit()
-    release_generation_lock(locked_job.user_id)
+    # The generation lock is ONE key per USER, not per job. Releasing it
+    # unconditionally here could free the lock of a NEWER generation the user
+    # started after this stuck job's own lock TTL had already lapsed (the lock
+    # expires on its own -- tool timeout + 30s -- long before the 10-minute
+    # sweep gets here): the sweep would then silently let them start a second
+    # concurrent generation, defeating the one-at-a-time rule. Only release
+    # once this was the user's last active job. (The job just failed above is
+    # already committed, so it no longer counts as active.)
+    if not generation_svc._user_has_active_generation_job(db, locked_job.user_id):
+        release_generation_lock(locked_job.user_id)
     if had_fal_slot:
         release_fal_slot(locked_job.team_id)
     return True
@@ -797,8 +833,23 @@ async def reconcile_fal_slots(ctx):
 async def startup(ctx):
     logger.info("arq worker started")
 
+    # Frozen-worker watchdog (see app/core/watchdog.py for the full story: a
+    # single hung blocking call froze this worker for 40+ minutes, alive but
+    # doing nothing, with no alert and no restart).
+    if settings.worker_watchdog_seconds > 0:
+        watchdog = WorkerWatchdog(settings.worker_watchdog_seconds)
+        watchdog.attach_to_loop(asyncio.get_running_loop())
+        watchdog.start()
+        ctx["watchdog"] = watchdog
+        logger.info("worker watchdog armed (threshold %ss)", settings.worker_watchdog_seconds)
+    else:
+        logger.warning("worker watchdog DISABLED (WORKER_WATCHDOG_SECONDS=0)")
+
 
 async def shutdown(ctx):
+    watchdog = ctx.get("watchdog")
+    if watchdog:
+        watchdog.stop()
     logger.info("arq worker shutting down")
 
 
@@ -811,6 +862,7 @@ class WorkerSettings:
         sweep_stale_generation_jobs,
         check_generation_timeouts,
         reconcile_fal_slots,
+        purge_expired_deleted_teams,
     ]
     cron_jobs = [
         cron(refill_due_subscriptions, hour=3, minute=0),
@@ -819,8 +871,18 @@ class WorkerSettings:
         cron(sweep_stale_generation_jobs, minute={0, 15, 30, 45}),
         cron(check_generation_timeouts, second={0, 15, 30, 45}),
         cron(reconcile_fal_slots, minute={0, 10, 20, 30, 40, 50}),
+        cron(purge_expired_deleted_teams, hour=4, minute=30),
     ]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
+    # arq refreshes its health sentinel (Redis key "arq:queue:health-check")
+    # from the worker's own main loop, so a frozen loop stops refreshing it and
+    # the key expires after interval+1 seconds. The DEFAULT interval is 3600s,
+    # which made the sentinel outlive a freeze by up to an hour and useless as
+    # a signal. 60s means a loop that has been blocked for ~1 minute is
+    # visible to `arq --check app.worker.WorkerSettings` (a Docker/K8s health
+    # probe) and to GET /health/worker -- long enough not to flap on a single
+    # legitimate 30s blocking HTTP call.
+    health_check_interval = 60
 
 
 WorkerSettings.on_startup = startup
