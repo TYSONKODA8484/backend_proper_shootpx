@@ -13,3 +13,4 @@ class Team(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     subscription_credits_remaining = Column(Integer, nullable=False, default=0)
     topup_credits_balance = Column(Integer, nullable=False, default=0)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)

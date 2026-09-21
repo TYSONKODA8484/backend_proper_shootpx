@@ -73,9 +73,19 @@
   <button id="checkout-pack-btn">POST credit-pack checkout</button>
   <span style="color:#777;font-size:13px;">owner only — opens Razorpay test checkout on success</span>
 </div>
+<div style="margin-top:8px;">
+  <input id="subscription-id" placeholder="subscription_id (weekly/monthly/yearly UUID)" size="42" />
+  <button id="checkout-sub-btn">POST subscription checkout</button>
+  <span style="color:#777;font-size:13px;">owner only — opens Razorpay subscription checkout on success</span>
+</div>
 <div style="color:#777;font-size:13px;margin-top:4px;">
-  Completing the Razorpay test payment only adds credits once the backend has a
-  public URL for the webhook (local runs get the order_id but no credit grant).
+  Completing the Razorpay test payment only adds credits once Razorpay's webhook
+  actually reaches this backend (payment.captured / subscription.activated) --
+  a plain 127.0.0.1 PUBLIC_BACKEND_URL is NOT reachable from Razorpay's servers,
+  you need a tunnel (e.g. ngrok) with that public URL registered as the webhook
+  URL on Razorpay's dashboard. After a successful checkout, the log below polls
+  billing every 3s (up to 2 minutes) instead of leaving you guessing whether it
+  worked -- it'll say clearly once credits actually land, or after 2 minutes.
 </div>
 
 <h2>5. Public</h2>
@@ -86,6 +96,290 @@
 <h2>6. Cache (admin)</h2>
 <input id="cache-secret" placeholder="cache clear secret" size="44" />
 <button id="clear-cache-btn">POST /admin/cache/clear</button>
+
+<h2>7. Generation (multipart /generate)</h2>
+<div>
+  <input id="gen-team-id" placeholder="team_id" size="38" />
+  <input id="gen-feature-type" placeholder="feature_type (e.g. recolor)" size="20" value="recolor" />
+  <button id="load-schema-btn">GET /tools/{feature_type}/schema</button>
+</div>
+<div id="gen-schema-info" style="color:#777;font-size:13px;margin-top:4px;">
+  Load a tool's schema to build the form below -- fields are never hardcoded here.
+</div>
+
+<div id="gen-fields" style="margin-top:10px;"></div>
+
+<div style="margin-top:10px;">
+  <label>Image(s): <input id="gen-images" type="file" accept="image/*" /></label>
+  <span id="gen-images-hint" style="color:#777;font-size:12px;"></span>
+</div>
+<div style="margin-top:8px;">
+  <label>output_count: <input id="gen-output-count" type="number" min="1" value="1" size="4" /></label>
+  <button id="gen-submit-btn">POST /generate</button>
+</div>
+
+<div id="gen-result" style="margin-top:12px;"></div>
+
+<h2>7b. Enhance Prompt (quick test)</h2>
+<div style="color:#777;font-size:13px;margin-bottom:4px;">
+  Type a plain prompt, click enhance, get the AI-rewritten text back -- no
+  image upload needed. Uses the same team_id as section 7 above.
+</div>
+<div>
+  <input id="enhance-prompt-input" placeholder="prompt to enhance" size="50" />
+  <input id="enhance-source-tool" placeholder="source_feature_type" size="16" value="recolor" />
+  <button id="enhance-prompt-btn">Enhance</button>
+</div>
+<div id="enhance-result" style="margin-top:10px;"></div>
+
+<h2>7c. Creative Photoshoot (quick test)</h2>
+<div style="color:#777;font-size:13px;margin-bottom:4px;">
+  Upload up to 5 product images, pick an idea and/or type your own prompt,
+  click Generate, get the image back. Uses the same team_id as section 7 above.
+</div>
+<div>
+  <label>Idea:
+    <select id="creative-idea">
+      <option value="">(none)</option>
+      <option value="Lifestyle / in-use scene">Lifestyle / in-use scene</option>
+      <option value="Sci-Fi">Sci-Fi</option>
+      <option value="Luxury">Luxury</option>
+    </select>
+  </label>
+  <input id="creative-prompt" placeholder="prompt (optional, or required if no idea)" size="34" />
+</div>
+<div style="margin-top:8px;">
+  <label>Aspect Ratio:
+    <select id="creative-aspect-ratio">
+      <option value="1:1">1:1</option>
+      <option value="4:3">4:3</option>
+      <option value="3:4">3:4</option>
+      <option value="16:9">16:9</option>
+      <option value="9:16">9:16</option>
+    </select>
+  </label>
+  <label style="margin-left:12px;">Resolution:
+    <select id="creative-resolution">
+      <option value="1k">1K</option>
+      <option value="2k">2K</option>
+      <option value="4k">4K</option>
+    </select>
+  </label>
+  <label style="margin-left:12px;">Quality:
+    <select id="creative-quality">
+      <option value="low">Low</option>
+      <option value="medium" selected>Medium</option>
+      <option value="high">High</option>
+      <option value="xhigh">Extra High</option>
+      <option value="max">Max</option>
+    </select>
+  </label>
+  <span style="color:#777;font-size:12px;display:block;margin-top:4px;">
+    credit_cost = quality_multiplier x resolution_multiplier -- see the "Charged" line
+    in the result below, read straight from the backend's response (never computed here)
+  </span>
+</div>
+<div style="margin-top:8px;">
+  <label>Image(s): <input id="creative-images" type="file" accept="image/*" multiple /></label>
+  <span style="color:#777;font-size:12px;">up to 5</span>
+</div>
+<div style="margin-top:8px;">
+  <button id="creative-photoshoot-btn">Generate</button>
+</div>
+<div id="creative-result" style="margin-top:10px;"></div>
+
+<h2>7d. Listing Photoshoot (quick test)</h2>
+<div style="color:#777;font-size:13px;margin-bottom:4px;">
+  Upload up to 5 product images, optionally steer it with a prompt, click
+  Generate. Plans N distinct shots (hero/side/wearing/sole, etc.) up front,
+  then creates one job per shot -- this is a BATCH, so results render in the
+  "7. Generation" result area above (reuses the same batch poller). Uses the
+  same team_id as section 7.
+</div>
+<div>
+  <input id="listing-prompt" placeholder="prompt (optional -- steers shot planning)" size="40" />
+</div>
+<div style="margin-top:8px;">
+  <label>Aspect Ratio:
+    <select id="listing-aspect-ratio">
+      <option value="1:1">1:1</option>
+      <option value="4:3">4:3</option>
+      <option value="3:4">3:4</option>
+      <option value="16:9">16:9</option>
+      <option value="9:16">9:16</option>
+    </select>
+  </label>
+  <label style="margin-left:12px;">Resolution:
+    <select id="listing-resolution">
+      <option value="1k">1K</option>
+      <option value="2k">2K</option>
+      <option value="4k">4K</option>
+    </select>
+  </label>
+  <label style="margin-left:12px;">Quality:
+    <select id="listing-quality">
+      <option value="low">Low</option>
+      <option value="medium" selected>Medium</option>
+      <option value="high">High</option>
+      <option value="xhigh">Extra High</option>
+      <option value="max">Max</option>
+    </select>
+  </label>
+</div>
+<div style="margin-top:8px;">
+  <label>Number of shots: <input id="listing-output-count" type="number" min="1" max="8" placeholder="tool default (4)" size="4" /></label>
+  <span style="color:#777;font-size:12px;">hard cap of 8 shots per batch (see app/tools/listing_planner.py) -- leave blank to use the tool's own default</span>
+</div>
+<div style="margin-top:8px;">
+  <label>Image(s): <input id="listing-images" type="file" accept="image/*" multiple /></label>
+  <span style="color:#777;font-size:12px;">up to 5</span>
+</div>
+<div style="margin-top:8px;">
+  <button id="listing-photoshoot-btn">Generate</button>
+</div>
+<div id="listing-result" style="margin-top:10px;color:#777;font-size:13px;"></div>
+
+<h2>7e. Model Shoot -- Generate Model (quick test)</h2>
+<div style="color:#777;font-size:13px;margin-bottom:4px;">
+  Pick structured attributes for an AI model, click Generate -- no image
+  upload, produces a single studio portrait image (openai/gpt-image-2,
+  text-to-image). Uses the same team_id as section 7 above.
+</div>
+<div>
+  <label>Gender:
+    <select id="msgm-gender">
+      <option value="Female">Female</option>
+      <option value="Male">Male</option>
+    </select>
+  </label>
+  <label style="margin-left:8px;">Age:
+    <select id="msgm-age">
+      <option value="Young adult (25-30)">Young adult (25-30)</option>
+      <option value="Adult (30s-40s)" selected>Adult (30s-40s)</option>
+      <option value="Mature adult (50+)">Mature adult (50+)</option>
+    </select>
+  </label>
+</div>
+<div style="margin-top:8px;">
+  <label>Ethnicity:
+    <select id="msgm-ethnicity">
+      <option>South Asian</option><option>East Asian</option><option>Southeast Asian</option>
+      <option>Middle Eastern</option><option>Black</option><option>Hispanic/Latino</option>
+      <option>White/Caucasian</option><option>Mixed/Other</option>
+    </select>
+  </label>
+  <label style="margin-left:8px;">Skin tone:
+    <select id="msgm-skin-tone">
+      <option>Fair</option><option>Light</option><option>Tan</option><option>Deep</option>
+    </select>
+  </label>
+</div>
+<div style="margin-top:8px;">
+  <label>Body type:
+    <select id="msgm-body-type">
+      <option>Slim</option><option>Athletic</option><option>Average</option>
+      <option>Curvy</option><option>Plus size</option>
+    </select>
+  </label>
+</div>
+<div style="margin-top:8px;">
+  <input id="msgm-notes" placeholder="notes (optional)" size="40" />
+</div>
+<div style="margin-top:8px;">
+  <button id="msgm-btn">Generate</button>
+</div>
+<div id="msgm-result" style="margin-top:10px;"></div>
+
+<h2>7f. Model Shoot (quick test)</h2>
+<div style="color:#777;font-size:13px;margin-bottom:4px;">
+  Upload a model reference photo (required) plus garments -- grouped by
+  product, not one flat list, so the planner can tell "2 angles of one top"
+  apart from "a top + a bottom": Top and Bottom are their own slots, plus up
+  to 3 named extra slots (watch, hat, shoes, bag, ...) -- each slot can hold
+  multiple images (angles) of that SAME item. Optional style/pose
+  reference(s) never count as product identity. Plans N pose prompts up
+  front, then creates one job per prompt -- a BATCH, so results render in the
+  "7. Generation" result area above. Uses the same team_id as section 7.
+</div>
+<div>
+  <b>Model reference (required -- upload a photo OR pick a preset below, not both):</b>
+</div>
+<div style="margin-top:6px;">
+  <label>Upload: <input id="model-shoot-model-image" type="file" accept="image/*" /></label>
+  <span id="model-shoot-model-image-clear" style="display:none;color:#777;font-size:12px;margin-left:8px;cursor:pointer;text-decoration:underline;">clear</span>
+</div>
+<div style="margin-top:8px;">
+  <div style="color:#777;font-size:12px;margin-bottom:4px;">
+    Or pick a preset (loads automatically once signed in):
+    <button id="model-shoot-reload-presets-btn" style="font-size:11px;padding:2px 8px;">reload</button>
+  </div>
+  <div id="model-shoot-preset-list" style="display:flex;gap:8px;flex-wrap:wrap;">(none loaded yet -- sign in first)</div>
+</div>
+<div style="margin-top:10px;padding:8px;border:1px solid #ddd;border-radius:6px;">
+  <b style="font-size:13px;">Garments (grouped by product)</b>
+  <div style="margin-top:6px;">
+    <label>Top: <input id="model-shoot-top-images" type="file" accept="image/*" multiple /></label>
+    <span style="color:#777;font-size:12px;">1+ angles of the same top, if any</span>
+  </div>
+  <div style="margin-top:6px;">
+    <label>Bottom: <input id="model-shoot-bottom-images" type="file" accept="image/*" multiple /></label>
+    <span style="color:#777;font-size:12px;">1+ angles of the same bottom, if any</span>
+  </div>
+  <div style="margin-top:6px;">
+    <input id="model-shoot-extra-label-1" placeholder="extra product name (e.g. Watch)" size="20" />
+    <label style="margin-left:6px;">Images: <input id="model-shoot-extra-images-1" type="file" accept="image/*" multiple /></label>
+  </div>
+  <div style="margin-top:6px;">
+    <input id="model-shoot-extra-label-2" placeholder="extra product name (e.g. Hat)" size="20" />
+    <label style="margin-left:6px;">Images: <input id="model-shoot-extra-images-2" type="file" accept="image/*" multiple /></label>
+  </div>
+  <div style="margin-top:6px;">
+    <input id="model-shoot-extra-label-3" placeholder="extra product name (e.g. Shoes)" size="20" />
+    <label style="margin-left:6px;">Images: <input id="model-shoot-extra-images-3" type="file" accept="image/*" multiple /></label>
+  </div>
+</div>
+<div style="margin-top:8px;">
+  <label>Style/pose reference(s) (optional): <input id="model-shoot-reference-images" type="file" accept="image/*" multiple /></label>
+</div>
+<div style="margin-top:8px;">
+  <input id="model-shoot-prompt" placeholder="prompt (optional -- steers pose planning)" size="40" />
+</div>
+<div style="margin-top:8px;">
+  <label>Aspect ratio:
+    <select id="model-shoot-aspect-ratio">
+      <option value="1:1">1:1</option>
+      <option value="3:4">3:4</option>
+      <option value="4:3">4:3</option>
+      <option value="16:9">16:9</option>
+      <option value="9:16">9:16</option>
+    </select>
+  </label>
+  <label style="margin-left:12px;">Resolution:
+    <select id="model-shoot-resolution">
+      <option value="1k">1K</option>
+      <option value="2k">2K</option>
+      <option value="4k">4K</option>
+    </select>
+  </label>
+</div>
+<div style="margin-top:8px;">
+  <label>Number of shots: <input id="model-shoot-output-count" type="number" min="1" max="8" placeholder="tool default (4)" size="4" /></label>
+  <span style="color:#777;font-size:12px;">hard cap of 8 shots per batch -- leave blank to use the tool's own default</span>
+</div>
+<div style="margin-top:8px;">
+  <button id="model-shoot-btn">Generate</button>
+</div>
+<div id="model-shoot-result" style="margin-top:10px;color:#777;font-size:13px;"></div>
+
+<div style="margin-top:10px;">
+  <input id="lookup-job-id" placeholder="jobId" size="38" />
+  <button id="lookup-job-btn">GET /jobs/{id}</button>
+</div>
+
+<div style="color:#777;font-size:12px;margin-top:10px;">
+  Webhook endpoint (for sending a manual signed test webhook):
+  <code id="gen-webhook-url">POST {backend}/webhooks/fal?job_id={jobId}</code>
+</div>
 
 <h2>Log</h2>
 <button id="clear-log-btn">clear log</button>
@@ -99,7 +393,8 @@
   } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
   import { firebaseConfig } from "./firebase-config.js";
 
-  const BACKEND_URL = "http://127.0.0.1:8000";
+  const BACKEND_URL = "http://127.0.0.1:8000"; // dev mode -- local backend + local worker + local Redis
+  // const BACKEND_URL = "https://backend-proper-shootpx.onrender.com"; // staging mode render
   const auth = getAuth(initializeApp(firebaseConfig));
 
   const logEl = document.getElementById("log");
@@ -265,6 +560,40 @@
     return call("GET", `/teams/${teamId}/billing`, { auth: true });
   };
 
+  // Credits only actually land once Razorpay's webhook reaches this backend
+  // (payment.captured / subscription.activated -> app/services/webhooks.py)
+  // -- NOT at the moment Razorpay's own checkout popup reports success to
+  // the browser. That webhook hop (Razorpay's own delivery timing, plus
+  // however your local backend is reachable from it -- a tunnel, if you're
+  // testing locally) is real network latency this console can't shorten.
+  // What it CAN fix: silence. The old handler just logged the client-side
+  // "success" and left you staring at stale billing data with zero signal
+  // that anything was still happening -- indistinguishable from a silent
+  // failure. This polls billing every 3s (up to 2 minutes) and reports
+  // exactly what's happening at each step.
+  async function pollBillingUntilChanged(teamId, before, label) {
+    const deadline = Date.now() + 120000;
+    log(`${label}: waiting for Razorpay's webhook to reach the backend...`, { before });
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const { status, data } = await call("GET", `/teams/${teamId}/billing`, { auth: true });
+      if (status !== 200) continue;
+      const changed =
+        data.totalCredits !== before.totalCredits ||
+        data.subscriptionStatus !== before.subscriptionStatus;
+      if (changed) {
+        log(`${label}: credits updated -- webhook processed`, data);
+        return;
+      }
+    }
+    log(`${label}: still unchanged after 2 minutes`, {
+      hint: "Not a code bug by itself -- confirm Razorpay's webhook URL (dashboard) actually " +
+        "points at a URL that reaches this backend (127.0.0.1 alone is NOT reachable from " +
+        "Razorpay's servers -- you need a tunnel, e.g. ngrok, with that public URL registered " +
+        "on Razorpay), then check this backend's own logs for a POST /billing/webhook call.",
+    });
+  }
+
   $("checkout-pack-btn").onclick = async () => {
     const teamId = $("billing-team-id").value.trim();
     const packId = $("pack-id").value.trim();
@@ -278,6 +607,9 @@
     if (typeof Razorpay === "undefined") {
       return log("Razorpay checkout", { error: "checkout.js failed to load (offline?)", order: data });
     }
+    // Snapshot billing BEFORE opening checkout so the post-payment poll below
+    // has a real baseline to detect a change against.
+    const before = (await call("GET", `/teams/${teamId}/billing`, { auth: true }))?.data || {};
     const rzp = new Razorpay({
       key: data.key_id,
       order_id: data.order_id,
@@ -286,7 +618,43 @@
       name: "ShootPX",
       description: "Credit pack (test mode)",
       prefill: { email: auth.currentUser?.email || "" },
-      handler: (resp) => log("Razorpay payment success (client)", resp),
+      handler: (resp) => {
+        log("Razorpay payment success (client)", resp);
+        pollBillingUntilChanged(teamId, before, "credit-pack purchase");
+      },
+      modal: { ondismiss: () => log("Razorpay checkout", { dismissed: true }) },
+    });
+    rzp.on("payment.failed", (resp) => log("Razorpay payment failed", resp.error));
+    rzp.open();
+  };
+
+  $("checkout-sub-btn").onclick = async () => {
+    const teamId = $("billing-team-id").value.trim();
+    const subId = $("subscription-id").value.trim();
+    if (!teamId || !subId) return log("subscription checkout", { error: "team_id and subscription_id required" });
+
+    const { status, data } = await call(
+      "POST", `/billing/teams/${teamId}/subscriptions/${subId}/checkout`, { auth: true }
+    );
+    if (status !== 200 || !data?.razorpay_subscription_id) return;
+
+    if (typeof Razorpay === "undefined") {
+      return log("Razorpay checkout", { error: "checkout.js failed to load (offline?)", subscription: data });
+    }
+    // Snapshot billing BEFORE opening checkout so the post-payment poll below
+    // has a real baseline to detect a change against.
+    const before = (await call("GET", `/teams/${teamId}/billing`, { auth: true }))?.data || {};
+    // Subscription checkout: pass subscription_id (not order_id) in the options.
+    const rzp = new Razorpay({
+      key: data.key_id,
+      subscription_id: data.razorpay_subscription_id,
+      name: "ShootPX",
+      description: "Subscription (test mode)",
+      prefill: { email: auth.currentUser?.email || "" },
+      handler: (resp) => {
+        log("Razorpay subscription success (client)", resp);
+        pollBillingUntilChanged(teamId, before, "subscription checkout");
+      },
       modal: { ondismiss: () => log("Razorpay checkout", { dismissed: true }) },
     });
     rzp.on("payment.failed", (resp) => log("Razorpay payment failed", resp.error));
@@ -301,6 +669,547 @@
     call("POST", "/admin/cache/clear", { headers: { "x-cache-secret": $("cache-secret").value } });
 
   $("clear-log-btn").onclick = () => { logEl.textContent = ""; };
+
+  // --- Generation: schema-driven /generate form -------------------------
+  // Drives a real POST /generate as genuine multipart/form-data (a real file
+  // input, not JSON). Fields come entirely from GET /tools/{feature_type}/schema
+  // -- nothing about Recolor (or any other tool) is hardcoded here, so this
+  // stays useful as new tools are added.
+  let currentSchema = null; // { featureType, maxInputImages, paramSchema }
+  let pollTimer = null;
+
+  function optionValue(opt) { return typeof opt === "object" ? opt.value : opt; }
+  function optionLabel(opt) {
+    if (typeof opt !== "object") return String(opt);
+    return opt.credit_cost != null ? `${opt.value} (${opt.credit_cost} credits)` : String(opt.value);
+  }
+
+  function renderSchemaFields(schema) {
+    const container = $("gen-fields");
+    container.innerHTML = "";
+
+    for (const field of schema.paramSchema || []) {
+      const row = document.createElement("div");
+      row.style.margin = "6px 0";
+
+      const label = document.createElement("label");
+      label.textContent = `${field.label || field.name}${field.required ? " *" : ""}: `;
+      label.htmlFor = `gen-field-${field.name}`;
+      row.appendChild(label);
+
+      if (field.type === "select") {
+        const select = document.createElement("select");
+        select.id = `gen-field-${field.name}`;
+        if (!field.required) {
+          const blank = document.createElement("option");
+          blank.value = "";
+          blank.textContent = "(none)";
+          select.appendChild(blank);
+        }
+        for (const opt of field.options || []) {
+          const optionEl = document.createElement("option");
+          optionEl.value = optionValue(opt);
+          optionEl.textContent = optionLabel(opt);
+          select.appendChild(optionEl);
+        }
+        row.appendChild(select);
+      } else {
+        const input = document.createElement("input");
+        input.type = "text";
+        input.id = `gen-field-${field.name}`;
+        input.size = 30;
+        row.appendChild(input);
+
+        // Convenience only, not hardcoding: any text field whose name looks
+        // like a color gets a paired native color-picker that fills it in.
+        if (field.name.toLowerCase().includes("color")) {
+          const picker = document.createElement("input");
+          picker.type = "color";
+          picker.style.marginLeft = "6px";
+          picker.oninput = () => { input.value = picker.value; };
+          row.appendChild(picker);
+        }
+      }
+
+      container.appendChild(row);
+    }
+
+    const imagesInput = $("gen-images");
+    const max = schema.maxInputImages || 1;
+    imagesInput.multiple = max > 1;
+    $("gen-images-hint").textContent = `up to ${max} image(s) for this tool`;
+  }
+
+  $("load-schema-btn").onclick = async () => {
+    const featureType = $("gen-feature-type").value.trim();
+    if (!featureType) return log("GET schema", { error: "feature_type required" });
+
+    const { status, data } = await call("GET", `/tools/${featureType}/schema`, { auth: true });
+    if (status !== 200) {
+      currentSchema = null;
+      $("gen-fields").innerHTML = "";
+      $("gen-schema-info").textContent = "Failed to load schema -- see log.";
+      return;
+    }
+
+    currentSchema = data;
+    $("gen-schema-info").textContent =
+      `Loaded "${data.featureType}" -- ${data.paramSchema.length} field(s), max ${data.maxInputImages} image(s).`;
+    renderSchemaFields(data);
+  };
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  function renderBatchStatus(batchId, batch, partialNote) {
+    const box = $("gen-result");
+    const jobs = batch.jobs || [];
+    const allTerminal = jobs.length > 0 && jobs.every(j => j.status === "completed" || j.status === "failed");
+
+    box.innerHTML = "";
+
+    if (partialNote) {
+      // Surfaced straight off /generate's own response (requestedCount/
+      // grantedCount/partial) -- create_generation_batch granted fewer
+      // outputs than requested because the team's shared credit balance
+      // couldn't cover the full ask right now (see spend_credits_up_to in
+      // app/services/credits.py). Kept visible across every poll, not just
+      // the first render, since the batch itself never gains the missing jobs.
+      const notice = document.createElement("div");
+      notice.style.color = "#b45309";
+      notice.style.marginBottom = "6px";
+      notice.textContent =
+        `requested ${partialNote.requestedCount}, only ${partialNote.grantedCount} granted ` +
+        `(insufficient team credits at submit time)`;
+      box.appendChild(notice);
+    }
+
+    const totalCredits = jobs.reduce((sum, j) => sum + (j.creditsCharged || 0), 0);
+    const title = document.createElement("div");
+    title.innerHTML =
+      `<b>batchId:</b> ${batchId} ${allTerminal ? "(done)" : "(polling every 3s...)"} -- ` +
+      `<b>${totalCredits} credit(s) charged total</b> -- check section 4's balance before/after to confirm the cut`;
+    box.appendChild(title);
+
+    for (const job of jobs) {
+      const row = document.createElement("div");
+      row.style.margin = "6px 0";
+      row.style.padding = "6px";
+      row.style.border = "1px solid #ddd";
+      row.style.borderRadius = "6px";
+      let html = `<b>${job.jobId}</b> -- ${job.status} -- <b>${job.creditsCharged ?? "?"} credit(s)</b>`;
+      if (job.errorMessage) html += ` -- <span style="color:#b91c1c">${job.errorMessage}</span>`;
+      row.innerHTML = html;
+      if (job.outputUrl) {
+        const img = document.createElement("img");
+        img.src = job.outputUrl;
+        img.style.maxWidth = "160px";
+        img.style.display = "block";
+        img.style.marginTop = "4px";
+        row.appendChild(img);
+      }
+      box.appendChild(row);
+
+      // Point the webhook helper at the most recent job so a manual signed
+      // test webhook can be aimed at it directly.
+      $("gen-webhook-url").textContent = `POST ${BACKEND_URL}/webhooks/fal?job_id=${job.jobId}`;
+    }
+
+    if (allTerminal) stopPolling();
+  }
+
+  function startPollingBatch(batchId, partialNote) {
+    stopPolling();
+    const poll = async () => {
+      const { status, data } = await call("GET", `/batches/${batchId}`, { auth: true });
+      if (status === 200) renderBatchStatus(batchId, data, partialNote);
+      else stopPolling();
+    };
+    poll();
+    pollTimer = setInterval(poll, 3000);
+  }
+
+  $("gen-submit-btn").onclick = async () => {
+    const teamId = $("gen-team-id").value.trim();
+    const featureType = $("gen-feature-type").value.trim();
+    const images = $("gen-images").files;
+
+    if (!teamId || !featureType) return log("POST /generate", { error: "team_id and feature_type required" });
+    if (!images || images.length === 0) return log("POST /generate", { error: "select at least one image" });
+    if (!currentSchema) return log("POST /generate", { error: "load the tool's schema first" });
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", featureType);
+    formData.append("output_count", $("gen-output-count").value || "1");
+
+    for (const field of currentSchema.paramSchema || []) {
+      const el = document.getElementById(`gen-field-${field.name}`);
+      const value = el ? el.value.trim() : "";
+      if (value) formData.append(field.name, value);
+    }
+
+    for (const file of images) formData.append("images", file);
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.batchId) return;
+
+    startPollingBatch(data.batchId, data.partial ? data : null);
+  };
+
+  // --- Enhance Prompt: quick text-in / text-out test, no images ---------
+  $("enhance-prompt-btn").onclick = async () => {
+    const box = $("enhance-result");
+    const teamId = $("gen-team-id").value.trim();
+    const prompt = $("enhance-prompt-input").value.trim();
+    const sourceFeatureType = $("enhance-source-tool").value.trim();
+
+    if (!teamId) return (box.textContent = "enter a team_id in section 7 above first");
+    if (!prompt) return (box.textContent = "enter a prompt to enhance");
+
+    box.textContent = "enhancing...";
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", "enhance_prompt");
+    formData.append("prompt", prompt);
+    formData.append("source_feature_type", sourceFeatureType || "recolor");
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.jobs?.[0]?.jobId) {
+      box.textContent = "failed to start -- see log below";
+      return;
+    }
+
+    const jobId = data.jobs[0].jobId;
+    const start = Date.now();
+    const poll = async () => {
+      const { status: s, data: d } = await call("GET", `/jobs/${jobId}`, { auth: true });
+      if (s !== 200) { box.textContent = "lookup failed -- see log"; return; }
+
+      if (d.status === "completed") {
+        box.innerHTML = `<b>Enhanced:</b><br><pre style="white-space:pre-wrap;">${d.outputText || "(empty)"}</pre>`;
+        return;
+      }
+      if (d.status === "failed") {
+        box.innerHTML = `<span style="color:#b91c1c">Failed: ${d.errorMessage || "unknown error"}</span>`;
+        return;
+      }
+      if (Date.now() - start > 30000) { box.textContent = `still ${d.status} after 30s -- giving up polling`; return; }
+      box.textContent = `${d.status}... (polling)`;
+      setTimeout(poll, 1500);
+    };
+    poll();
+  };
+
+  // --- Creative Photoshoot: quick image-in / image-out test ---------------
+  // "Charged: X credits" below is read straight off GET /jobs/{id}'s own
+  // creditsCharged field -- the number the backend actually deducted at job
+  // creation (resolve_generation_params's quality_multiplier x
+  // resolution_multiplier, see app/tools/creative_photoshoot.py). This panel
+  // never computes that number itself, so it doubles as a live check that
+  // the backend math matches the priced table.
+  $("creative-photoshoot-btn").onclick = async () => {
+    const box = $("creative-result");
+    const teamId = $("gen-team-id").value.trim();
+    const idea = $("creative-idea").value;
+    const prompt = $("creative-prompt").value.trim();
+    const aspectRatio = $("creative-aspect-ratio").value;
+    const resolution = $("creative-resolution").value;
+    const quality = $("creative-quality").value;
+    const images = $("creative-images").files;
+
+    if (!teamId) return (box.textContent = "enter a team_id in section 7 above first");
+    if (!idea && !prompt) return (box.textContent = "pick an idea or type a prompt (at least one is required)");
+    if (!images || images.length === 0) return (box.textContent = "select at least one product image");
+
+    box.textContent = "generating...";
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", "creative_photoshoot");
+    if (idea) formData.append("idea", idea);
+    if (prompt) formData.append("prompt", prompt);
+    formData.append("aspect_ratio", aspectRatio);
+    formData.append("resolution", resolution);
+    formData.append("quality", quality);
+    for (const file of images) formData.append("images", file);
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.jobs?.[0]?.jobId) {
+      box.textContent = "failed to start -- see log below";
+      return;
+    }
+
+    const jobId = data.jobs[0].jobId;
+    const start = Date.now();
+    const poll = async () => {
+      const { status: s, data: d } = await call("GET", `/jobs/${jobId}`, { auth: true });
+      if (s !== 200) { box.textContent = "lookup failed -- see log"; return; }
+
+      const charged = `<div style="margin-top:6px;"><b>Charged: ${d.creditsCharged ?? "?"} credit(s)</b> -- ${aspectRatio} / ${resolution} / ${quality}</div>`;
+
+      if (d.status === "completed") {
+        box.innerHTML = charged;
+        if (d.outputUrl) {
+          const img = document.createElement("img");
+          img.src = d.outputUrl;
+          img.style.maxWidth = "300px";
+          img.style.display = "block";
+          box.appendChild(img);
+        } else {
+          box.innerHTML += "completed with no outputUrl (unexpected)";
+        }
+        return;
+      }
+      if (d.status === "failed") {
+        box.innerHTML = `${charged}<span style="color:#b91c1c">Failed: ${d.errorMessage || "unknown error"}</span>`;
+        return;
+      }
+      if (Date.now() - start > 240000) { box.innerHTML = `${charged}still ${d.status} after 240s -- giving up polling`; return; }
+      box.innerHTML = `${charged}${d.status}... (polling)`;
+      setTimeout(poll, 2000);
+    };
+    poll();
+  };
+
+  // --- Listing Photoshoot: quick multi-shot batch test --------------------
+  // Requested vs granted shot counts come straight off /generate's own
+  // response (requestedCount/grantedCount/partial) -- if the team's shared
+  // credit balance couldn't cover every requested shot, create_generation_batch
+  // grants a smaller batch instead of rejecting the whole request (see
+  // spend_credits_up_to in app/services/credits.py), and that's surfaced here
+  // rather than silently under-delivering.
+  $("listing-photoshoot-btn").onclick = async () => {
+    const box = $("listing-result");
+    const teamId = $("gen-team-id").value.trim();
+    const prompt = $("listing-prompt").value.trim();
+    const aspectRatio = $("listing-aspect-ratio").value;
+    const resolution = $("listing-resolution").value;
+    const quality = $("listing-quality").value;
+    const outputCountRaw = $("listing-output-count").value.trim();
+    const images = $("listing-images").files;
+
+    if (!teamId) return (box.textContent = "enter a team_id in section 7 above first");
+    if (!images || images.length === 0) return (box.textContent = "select at least one product image");
+
+    box.textContent = "planning shots + generating -- results will appear in the section 7 result area above...";
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", "listing_photoshoot");
+    if (prompt) formData.append("prompt", prompt);
+    formData.append("aspect_ratio", aspectRatio);
+    formData.append("resolution", resolution);
+    formData.append("quality", quality);
+    if (outputCountRaw) formData.append("output_count", outputCountRaw);
+    for (const file of images) formData.append("images", file);
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.batchId) {
+      box.textContent = "failed to start -- see log below";
+      return;
+    }
+
+    const partialNote = data.partial
+      ? ` -- requested ${data.requestedCount}, only ${data.grantedCount} granted (insufficient team credits at submit time)`
+      : "";
+    box.innerHTML = data.partial
+      ? `<span style="color:#b45309;">started batch ${data.batchId} (${data.jobs.length} shot${data.jobs.length === 1 ? "" : "s"})${partialNote} -- see section 7 result area above</span>`
+      : `started batch ${data.batchId} (${data.jobs.length} shot${data.jobs.length === 1 ? "" : "s"}) -- see section 7 result area above`;
+    startPollingBatch(data.batchId, data.partial ? data : null);
+  };
+
+  // --- Model Shoot: Generate Model -- structured attributes, no images ----
+  $("msgm-btn").onclick = async () => {
+    const box = $("msgm-result");
+    const teamId = $("gen-team-id").value.trim();
+
+    if (!teamId) return (box.textContent = "enter a team_id in section 7 above first");
+
+    box.textContent = "generating...";
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", "model_shoot_generate_model");
+    formData.append("gender", $("msgm-gender").value);
+    formData.append("age_bracket", $("msgm-age").value);
+    formData.append("ethnicity", $("msgm-ethnicity").value);
+    formData.append("skin_tone", $("msgm-skin-tone").value);
+    formData.append("body_type", $("msgm-body-type").value);
+    const notes = $("msgm-notes").value.trim();
+    if (notes) formData.append("notes", notes);
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.jobs?.[0]?.jobId) {
+      box.textContent = "failed to start -- see log below";
+      return;
+    }
+
+    const jobId = data.jobs[0].jobId;
+    const start = Date.now();
+    const poll = async () => {
+      const { status: s, data: d } = await call("GET", `/jobs/${jobId}`, { auth: true });
+      if (s !== 200) { box.textContent = "lookup failed -- see log"; return; }
+
+      if (d.status === "completed") {
+        box.innerHTML = "";
+        if (d.outputUrl) {
+          const img = document.createElement("img");
+          img.src = d.outputUrl;
+          img.style.maxWidth = "300px";
+          img.style.display = "block";
+          box.appendChild(img);
+        } else {
+          box.textContent = "completed with no outputUrl (unexpected)";
+        }
+        return;
+      }
+      if (d.status === "failed") {
+        box.innerHTML = `<span style="color:#b91c1c">Failed: ${d.errorMessage || "unknown error"}</span>`;
+        return;
+      }
+      // gpt-image-2 text-to-image genuinely takes ~110-115s for this tool
+      // (measured live), and its tool_definitions budget is 300s -- a 60s
+      // giveup here made completed generations look lost in the console
+      // while the backend was still correctly working on them.
+      if (Date.now() - start > 300000) { box.textContent = `still ${d.status} after 300s -- giving up polling`; return; }
+      box.textContent = `${d.status}... (polling, usually ~2 min)`;
+      setTimeout(poll, 2000);
+    };
+    poll();
+  };
+
+  // --- Model Shoot: model reference = upload OR a preset, never both ------
+  let selectedModelPresetId = null;
+
+  function renderModelShootPresets(presets) {
+    const list = $("model-shoot-preset-list");
+    list.innerHTML = "";
+    if (!presets.length) {
+      list.textContent = "(no active presets)";
+      return;
+    }
+    for (const preset of presets) {
+      const card = document.createElement("div");
+      card.style.cssText = "border:2px solid #ccc;border-radius:8px;padding:4px;cursor:pointer;text-align:center;width:88px;";
+      card.dataset.presetId = preset.id;
+      card.innerHTML = `
+        <img src="${preset.thumbnailUrl}" style="width:80px;height:80px;object-fit:cover;border-radius:4px;display:block;" />
+        <div style="font-size:12px;margin-top:4px;">${preset.name}</div>
+      `;
+      card.onclick = () => {
+        // Selecting a preset and uploading a file are mutually exclusive --
+        // /generate 400s if both model_image and model_preset_id are sent.
+        selectedModelPresetId = preset.id;
+        $("model-shoot-model-image").value = "";
+        $("model-shoot-model-image-clear").style.display = "none";
+        for (const el of list.children) el.style.borderColor = "#ccc";
+        card.style.borderColor = "#2563eb";
+      };
+      list.appendChild(card);
+    }
+  }
+
+  async function loadModelShootPresets() {
+    const list = $("model-shoot-preset-list");
+    list.textContent = "loading...";
+    const { status, data } = await call("GET", "/model-presets", { auth: true });
+    if (status !== 200) { list.textContent = "failed to load presets -- see log below"; return; }
+    renderModelShootPresets(data.presets || []);
+  }
+
+  $("model-shoot-reload-presets-btn").onclick = loadModelShootPresets;
+
+  // Choosing a file deselects any picked preset, same mutual-exclusion rule.
+  $("model-shoot-model-image").onchange = () => {
+    const hasFile = $("model-shoot-model-image").files.length > 0;
+    if (hasFile) {
+      selectedModelPresetId = null;
+      for (const el of $("model-shoot-preset-list").children) el.style.borderColor = "#ccc";
+    }
+    $("model-shoot-model-image-clear").style.display = hasFile ? "inline" : "none";
+  };
+  $("model-shoot-model-image-clear").onclick = () => {
+    $("model-shoot-model-image").value = "";
+    $("model-shoot-model-image-clear").style.display = "none";
+  };
+
+  // Auto-load presets once signed in (GET /model-presets requires auth) --
+  // fires on fresh sign-in and on a restored session after page reload.
+  onAuthStateChanged(auth, (user) => {
+    if (user) loadModelShootPresets();
+  });
+
+  // --- Model Shoot: 3-category multi-shot batch test ----------------------
+  $("model-shoot-btn").onclick = async () => {
+    const box = $("model-shoot-result");
+    const teamId = $("gen-team-id").value.trim();
+    const modelImage = $("model-shoot-model-image").files[0];
+    const topImages = $("model-shoot-top-images").files;
+    const bottomImages = $("model-shoot-bottom-images").files;
+    const extraLabel1 = $("model-shoot-extra-label-1").value.trim();
+    const extraImages1 = $("model-shoot-extra-images-1").files;
+    const extraLabel2 = $("model-shoot-extra-label-2").value.trim();
+    const extraImages2 = $("model-shoot-extra-images-2").files;
+    const extraLabel3 = $("model-shoot-extra-label-3").value.trim();
+    const extraImages3 = $("model-shoot-extra-images-3").files;
+    const referenceImages = $("model-shoot-reference-images").files;
+    const prompt = $("model-shoot-prompt").value.trim();
+    const aspectRatio = $("model-shoot-aspect-ratio").value;
+    const resolution = $("model-shoot-resolution").value;
+    const outputCountRaw = $("model-shoot-output-count").value.trim();
+
+    if (!teamId) return (box.textContent = "enter a team_id in section 7 above first");
+    if (!modelImage && !selectedModelPresetId) {
+      return (box.textContent = "upload a model reference image OR pick a preset (required)");
+    }
+    if (modelImage && selectedModelPresetId) {
+      return (box.textContent = "choose only one: an uploaded model image OR a preset, not both");
+    }
+
+    box.textContent = "planning shots + generating -- results will appear in the section 7 result area above...";
+
+    const formData = new FormData();
+    formData.append("team_id", teamId);
+    formData.append("feature_type", "model_shoot");
+    if (selectedModelPresetId) formData.append("model_preset_id", selectedModelPresetId);
+    else formData.append("model_image", modelImage);
+    for (const file of topImages) formData.append("top_images", file);
+    for (const file of bottomImages) formData.append("bottom_images", file);
+    if (extraLabel1) formData.append("extra_label_1", extraLabel1);
+    for (const file of extraImages1) formData.append("extra_images_1", file);
+    if (extraLabel2) formData.append("extra_label_2", extraLabel2);
+    for (const file of extraImages2) formData.append("extra_images_2", file);
+    if (extraLabel3) formData.append("extra_label_3", extraLabel3);
+    for (const file of extraImages3) formData.append("extra_images_3", file);
+    for (const file of referenceImages) formData.append("reference_images", file);
+    if (prompt) formData.append("prompt", prompt);
+    formData.append("aspect_ratio", aspectRatio);
+    formData.append("resolution", resolution);
+    if (outputCountRaw) formData.append("output_count", outputCountRaw);
+
+    const { status, data } = await call("POST", "/generate", { auth: true, body: formData });
+    if (status !== 200 || !data?.batchId) {
+      box.textContent = "failed to start -- see log below (blocked shoots return a 400 with the reason, unknown presets a 404)";
+      return;
+    }
+
+    const partialNote = data.partial
+      ? ` -- requested ${data.requestedCount}, only ${data.grantedCount} granted (insufficient team credits at submit time)`
+      : "";
+    box.innerHTML = data.partial
+      ? `<span style="color:#b45309;">started batch ${data.batchId} (${data.jobs.length} shot${data.jobs.length === 1 ? "" : "s"})${partialNote} -- see section 7 result area above</span>`
+      : `started batch ${data.batchId} (${data.jobs.length} shot${data.jobs.length === 1 ? "" : "s"}) -- see section 7 result area above`;
+    startPollingBatch(data.batchId, data.partial ? data : null);
+  };
+
+  $("lookup-job-btn").onclick = () => {
+    const jobId = $("lookup-job-id").value.trim();
+    if (!jobId) return log("GET job", { error: "jobId required" });
+    return call("GET", `/jobs/${jobId}`, { auth: true });
+  };
 </script>
 
 </body>

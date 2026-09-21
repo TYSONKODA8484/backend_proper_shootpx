@@ -1,9 +1,12 @@
 import logging
 import secrets
+from datetime import datetime, timedelta, timezone
 
 from firebase_admin import auth as firebase_auth
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
+from app.core.cache import acquire_cooldown
 from app.core.config import settings
 from app.core.email import send_email
 from app.models.team import Team
@@ -13,9 +16,26 @@ from app.services.teams import MAX_TEAM_MEMBERS, team_member_count, team_seat_co
 
 logger = logging.getLogger(__name__)
 
+# Separate namespace from authmail's cooldown key -- an email being both
+# invited and independently signing in shouldn't throttle each other.
+INVITE_EMAIL_COOLDOWN_SECONDS = 60
+
+# How long a pending invite stays valid. Expiry is a computed check
+# (expires_at <= now) everywhere it matters (this module's own lookup below,
+# team_seat_count, list_pending_invites, accept_invite) -- an expired invite
+# is never explicitly transitioned to its own status, it's just treated as
+# gone by every reader.
+INVITE_EXPIRY_DAYS = 7
+
 
 class TeamFullError(ValueError):
     """Raised when a team is already at MAX_TEAM_MEMBERS (members + pending invites)."""
+
+
+class InviteEmailRateLimitedError(Exception):
+    """An invite email was already sent to this address too recently. Only
+    per-IP rate limiting on the route previously guarded this -- trivial to
+    rotate past to email-bomb one target address."""
 
 
 def _invite_email_html(team_name: str, link: str, role: str) -> str:
@@ -56,23 +76,44 @@ def create_invite(
             TeamInvite.team_id == team_id,
             TeamInvite.email == email,
             TeamInvite.status == "pending",
+            TeamInvite.expires_at > datetime.now(timezone.utc),
         )
         .first()
     )
 
     if invite is None:
+        # Lock the team row for the rest of this transaction. Without this,
+        # two concurrent invite requests (or an invite racing an accept) can
+        # both read team_seat_count() before either commits, and both slip
+        # past the MAX_TEAM_MEMBERS check -- see the same pattern guarding
+        # balance updates in app/services/credits.py.
+        db.query(Team).filter(Team.id == team_id).with_for_update().first()
+
         # a brand-new invite takes a seat — block if the team is already full
         if team_seat_count(db, team_id) >= MAX_TEAM_MEMBERS:
             raise TeamFullError(
                 f"Team is full — max {MAX_TEAM_MEMBERS} members (owner + editors, "
                 "pending invites included)"
             )
+
+    # Rate-limit BEFORE creating/committing the invite row below. Doing this
+    # check after the commit meant a throttled request (e.g. the same email
+    # invited to a different team seconds earlier) still left a brand-new
+    # "pending" invite in the DB -- silently burning a seat -- even though no
+    # email was ever sent for it and the caller only saw a 429.
+    if not acquire_cooldown(f"invite:cooldown:{email}", INVITE_EMAIL_COOLDOWN_SECONDS):
+        raise InviteEmailRateLimitedError(
+            "An invite email was already sent to this address recently. Please wait a moment and try again."
+        )
+
+    if invite is None:
         invite = TeamInvite(
             team_id=team_id,
             email=email,
             role=role,
             token=secrets.token_urlsafe(24),
             invited_by=invited_by_user_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=INVITE_EXPIRY_DAYS),
         )
         db.add(invite)
         db.commit()
@@ -109,6 +150,47 @@ def create_invite(
     return invite
 
 
+def list_pending_invites(db: Session, team_id) -> list[dict]:
+    invites = (
+        db.query(TeamInvite)
+        .filter(
+            TeamInvite.team_id == team_id,
+            TeamInvite.status == "pending",
+            TeamInvite.expires_at > datetime.now(timezone.utc),
+        )
+        .order_by(TeamInvite.created_at)
+        .all()
+    )
+    return [
+        {
+            "id": str(i.id), "email": i.email, "role": i.role,
+            "createdAt": i.created_at.isoformat() if i.created_at else None,
+        }
+        for i in invites
+    ]
+
+
+def cancel_invite(db: Session, team_id, invite_id) -> None:
+    """
+    A mistyped invite, or one nobody ever accepts, previously had no way to
+    be freed -- team_seat_count() counts any "pending" invite toward the
+    MAX_TEAM_MEMBERS cap forever, with no expiry, so a bad invite permanently
+    burned a seat. This lets the owner reclaim it.
+    """
+    invite = (
+        db.query(TeamInvite)
+        .filter(TeamInvite.id == invite_id, TeamInvite.team_id == team_id)
+        .first()
+    )
+    if not invite:
+        raise ValueError("Invite not found")
+    if invite.status != "pending":
+        raise ValueError("Invite is no longer pending")
+
+    invite.status = "cancelled"
+    db.commit()
+
+
 def accept_invite(db: Session, token: str, user_id, user_email: str) -> TeamInvite:
     invite = db.query(TeamInvite).filter(TeamInvite.token == token).first()
 
@@ -116,6 +198,8 @@ def accept_invite(db: Session, token: str, user_id, user_email: str) -> TeamInvi
         raise ValueError("Invite not found")
     if invite.status != "pending":
         raise ValueError("Invite already used")
+    if invite.expires_at <= datetime.now(timezone.utc):
+        raise ValueError("This invite has expired -- ask the team owner to send a new one")
     if invite.email.strip().lower() != user_email.strip().lower():
         raise ValueError("This invite was sent to a different email address")
 
@@ -128,11 +212,31 @@ def accept_invite(db: Session, token: str, user_id, user_email: str) -> TeamInvi
         .first()
     )
     if member is None:
+        # Lock the team row for the rest of this transaction. Without this,
+        # two different invitees accepting at nearly the same moment can both
+        # read team_member_count() before either commits their new
+        # TeamMember row, jointly pushing the team past MAX_TEAM_MEMBERS --
+        # the unique constraint on (team_id, user_id) below only catches the
+        # same user accepting twice, not two different users overfilling the
+        # team. Same pattern as the balance locks in app/services/credits.py.
+        db.query(Team).filter(Team.id == invite.team_id).with_for_update().first()
+
         # joining as a new member takes a seat — block if the team filled up
         # since the invite was created
         if team_member_count(db, invite.team_id) >= MAX_TEAM_MEMBERS:
             raise TeamFullError(f"Team is full — max {MAX_TEAM_MEMBERS} members")
         db.add(TeamMember(team_id=invite.team_id, user_id=user_id, role=invite.role))
+        try:
+            db.flush()
+        except IntegrityError:
+            # Two concurrent accept-invite calls for the same user both passed
+            # the "already a member?" check above before either committed --
+            # the DB's own unique constraint on (team_id, user_id) caught the
+            # second one. The other request already created the membership;
+            # nothing left to do here but continue on as already-joined,
+            # rather than surface a confusing error for what is, from the
+            # user's point of view, a successful accept.
+            db.rollback()
     elif member.role != invite.role:
         # already on the team — apply the role from the invite
         member.role = invite.role

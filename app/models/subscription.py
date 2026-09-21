@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Text, Integer
+from sqlalchemy import Column, Text, Integer, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 import uuid
 from app.core.database import Base
@@ -17,3 +17,6 @@ class Subscription(Base):
     info = Column(JSONB, nullable=False, default=list)
     tag = Column(Text, nullable=True)
     sort_order = Column(Integer, nullable=False, default=0)
+    razorpay_plan_id = Column(Text, nullable=True)  
+    is_active = Column(Boolean, nullable=False, default=True)
+    total_count = Column(Integer, nullable=True)

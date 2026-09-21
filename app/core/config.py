@@ -16,6 +16,15 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # A secret pasted into Render's env var UI (or a .env file saved with
+        # a trailing newline) can silently carry a trailing "\n" into the
+        # value. That's invisible everywhere except when the value is later
+        # sent as a raw HTTP header, where h11 rejects it outright
+        # (httpx.LocalProtocolError: "Illegal header value ...\n") -- found
+        # live via supabase_service_role_key breaking every storage upload.
+        # Stripping whitespace on every string field closes this for all
+        # current and future settings, not just this one key.
+        str_strip_whitespace=True,
     )
 
     app_name: str
@@ -44,6 +53,23 @@ class Settings(BaseSettings):
     razorpay_key_id: str
     razorpay_key_secret: str
     razorpay_webhook_secret: str
+    fal_key: str
+    public_backend_url: str
+    supabase_url: str
+    supabase_service_role_key: str
+    fal_per_team_concurrency_limit: int
+    # --- worker health monitoring (both OPTIONAL, unlike everything above) ----
+    # Monitoring must not become a new way for a deploy to fail to boot, so
+    # these have safe defaults instead of being required.
+    # How long the arq worker's event loop may go without ticking before the
+    # in-process watchdog declares it frozen, alerts, and hard-exits so the
+    # process manager restarts it. Must comfortably exceed the longest
+    # LEGITIMATE blocking stretch (a few sequential 30s HTTP timeouts in one
+    # job). 0 disables the watchdog.
+    worker_watchdog_seconds: int = 180
+    # Optional Slack/Discord-style incoming webhook. When set, a frozen-worker
+    # event POSTs a message there in addition to the CRITICAL log line.
+    alert_webhook_url: str | None = None
 
     @property
     def cors_origins_list(self) -> list[str]:

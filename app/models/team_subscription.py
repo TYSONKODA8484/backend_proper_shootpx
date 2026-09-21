@@ -11,9 +11,21 @@ class TeamSubscription(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False, unique=True)
     subscription_id = Column(UUID(as_uuid=True), ForeignKey("subscription.id"), nullable=False)
-    razorpay_subscription_id = Column(Text, nullable=True)
+    razorpay_subscription_id = Column(Text, nullable=True, unique=True)
     status = Column(Text, nullable=False, default="active")
     credits_per_refill = Column(Integer, nullable=False)
+    # Razorpay's own monotonic charge counter, last acted on. Lets
+    # handle_subscription_charged tell a genuinely new renewal apart from a
+    # redelivered webhook for a charge it already processed.
+    last_paid_count = Column(Integer, nullable=False, default=0)
     next_refill_at = Column(DateTime(timezone=True), nullable=False)
     current_period_end = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Yearly plans have no per-cycle "charged" webhook to key a renewal
+    # notice off (total_count=1 -- there's only ever ONE charge, at the
+    # start of the year) -- worker.py's send_yearly_renewal_notices cron
+    # checks current_period_end directly instead, and this timestamp is
+    # its own idempotency guard (set once sent, so a daily cron tick never
+    # re-sends). Reset to NULL on a fresh subscribe (see
+    # create_subscription_checkout) so a new cycle can send its own notice.
+    renewal_notice_sent_at = Column(DateTime(timezone=True), nullable=True)
