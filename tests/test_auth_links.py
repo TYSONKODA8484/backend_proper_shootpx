@@ -72,3 +72,32 @@ def test_send_sign_in_link_cooldown_is_per_email_not_global(monkeypatch, _cleanu
     auth_links.send_sign_in_link(email_b, "https://app.test/continue")  # different email -- must not be blocked
 
     assert sent.call_count == 2
+
+
+def test_send_sign_in_link_releases_cooldown_on_failure(monkeypatch, _cleanup_cooldown_key):
+    """Real gap found live: the cooldown was acquired before Firebase/SMTP work,
+    but never released on failure -- a single transient error (SMTP down, bad
+    Firebase call) would lock a legitimate user out of retrying for the full
+    cooldown window even though nothing was ever sent."""
+    email = _unique_email()
+    _cleanup_cooldown_key.append(f"authmail:cooldown:{email}")
+
+    def _boom(email, settings):
+        raise RuntimeError("firebase is down")
+
+    monkeypatch.setattr(auth_links.firebase_auth, "generate_sign_in_with_email_link", _boom)
+    sent = MagicMock()
+    monkeypatch.setattr(auth_links, "send_email", sent)
+
+    with pytest.raises(RuntimeError):
+        auth_links.send_sign_in_link(email, "https://app.test/continue")
+
+    sent.assert_not_called()
+
+    # The failed attempt must not have consumed the cooldown -- a retry right
+    # after should be allowed to proceed (and succeed) instead of raising
+    # SignInLinkRateLimitedError.
+    monkeypatch.setattr(auth_links.firebase_auth, "generate_sign_in_with_email_link",
+                         lambda email, settings: "https://sign-in.test/link")
+    auth_links.send_sign_in_link(email, "https://app.test/continue")
+    sent.assert_called_once()

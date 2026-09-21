@@ -20,6 +20,36 @@ class RazorpayCancelError(RuntimeError):
     call failed' (delete_team logs-and-continues on the latter)."""
 
 
+def is_unpaid_checkout(team_sub) -> bool:
+    """
+    True for a subscription row that exists only because a checkout was STARTED
+    and never paid for: status "pending" with credits_per_refill still 0
+    (activation is the only thing that sets it above 0 -- see
+    webhooks.handle_subscription_activated).
+
+    "pending" is deliberately not enough on its own, because it also means
+    something completely different: handle_subscription_pending marks a
+    genuinely ACTIVE, paying subscription "pending" when a renewal payment
+    fails and Razorpay retries for days. Treating that customer's row as an
+    abandoned checkout would let it be replaced or, in the old cleanup cron,
+    deleted outright.
+    """
+    return team_sub is not None and team_sub.status == "pending" and (team_sub.credits_per_refill or 0) == 0
+
+
+def _cancel_abandoned_razorpay_subscription(razorpay_subscription_id: str) -> None:
+    """Best-effort. A never-paid ("created") Razorpay subscription can never
+    charge anyone, so failing to cancel it must not block the user's retry --
+    it is logged and left to expire."""
+    try:
+        razorpay_client.subscription.cancel(razorpay_subscription_id)
+    except Exception:
+        logger.warning(
+            "could not cancel abandoned Razorpay subscription %s -- harmless (never paid), left as is",
+            razorpay_subscription_id, exc_info=True,
+        )
+
+
 
 
 def create_credit_pack_checkout(db: Session, team_id, pack_id) -> dict:
@@ -74,8 +104,30 @@ def create_subscription_checkout(db: Session, team_id, subscription_id) -> dict:
         .with_for_update()
         .first()
     )
+    replaced_razorpay_id = None
     if row is not None and row.status in ("active", "pending"):
-        raise ValueError("This team already has an active subscription")
+        if not is_unpaid_checkout(row):
+            # a real subscription: active, or paying but mid renewal-retry
+            raise ValueError("This team already has an active subscription")
+
+        # An abandoned, never-paid checkout (the user closed Razorpay). This
+        # must NOT block them -- it was never a subscription.
+        if row.subscription_id == subscription_id and row.razorpay_subscription_id:
+            # Same plan again ("Retry payment", or a double click): hand back
+            # the SAME Razorpay subscription if it is still payable, instead of
+            # creating a second one and cancelling the first out from under a
+            # checkout window the user may have open.
+            try:
+                existing = razorpay_client.subscription.fetch(row.razorpay_subscription_id)
+            except Exception:
+                existing = None
+            if existing and existing.get("status") == "created":
+                return {
+                    "razorpay_subscription_id": row.razorpay_subscription_id,
+                    "key_id": settings.razorpay_key_id,
+                }
+        # Different plan, or the old one is no longer payable: replace it.
+        replaced_razorpay_id = row.razorpay_subscription_id
 
     # Claim a `pending` row BEFORE calling Razorpay — no external subscription is
     # created until this claim is secured. A brand-new team has no row, so two
@@ -91,6 +143,11 @@ def create_subscription_checkout(db: Session, team_id, subscription_id) -> dict:
     row.credits_per_refill = 0
     row.next_refill_at = now
     row.current_period_end = now
+    # A fresh lifecycle needs its own renewal notice -- without resetting
+    # this, a team resubscribing after a yearly plan completed (see
+    # worker.py's send_yearly_renewal_notices) would carry over the OLD
+    # cycle's sent_at and never get warned before the new cycle also ends.
+    row.renewal_notice_sent_at = None
 
     try:
         db.flush()
@@ -119,6 +176,11 @@ def create_subscription_checkout(db: Session, team_id, subscription_id) -> dict:
     row.razorpay_subscription_id = razor_sub["id"]
     db.commit()
 
+    # Only AFTER the replacement is committed, so a failure creating it leaves
+    # the user's previous (still payable) attempt untouched.
+    if replaced_razorpay_id:
+        _cancel_abandoned_razorpay_subscription(replaced_razorpay_id)
+
     return {
         "razorpay_subscription_id": razor_sub["id"],
         "key_id": settings.razorpay_key_id,
@@ -132,6 +194,17 @@ def cancel_subscription(db: Session, team_id) -> TeamSubscription:
 
     if not team_sub:
         raise ValueError("This team has no active subscription to cancel")
+
+    if is_unpaid_checkout(team_sub):
+        # Never paid, so there is no billing to stop and nothing that can go
+        # wrong by cancelling locally. Razorpay is told on a best-effort basis
+        # only: an error there must not leave the user stuck with an "already
+        # in progress" attempt they are trying to get rid of.
+        if team_sub.razorpay_subscription_id:
+            _cancel_abandoned_razorpay_subscription(team_sub.razorpay_subscription_id)
+        team_sub.status = "cancelled"
+        db.commit()
+        return team_sub
 
     # Tell Razorpay to stop billing BEFORE we touch local state. If this fails we
     # leave status untouched — never show 'cancelled' while the card is still
@@ -158,6 +231,13 @@ def switch_subscription(db: Session, team_id, new_subscription_id) -> dict:
         raise ValueError("New plan not found")
     if not new_plan.razorpay_plan_id:
         raise ValueError("This plan is not configured for payment yet")
+
+    existing = db.query(TeamSubscription).filter(TeamSubscription.team_id == team_id).first()
+    if is_unpaid_checkout(existing):
+        # "Switching" away from a checkout that was never paid is just starting
+        # a fresh checkout: nothing to cancel, and no leftover credits to carry
+        # over (a never-activated subscription never granted any).
+        return create_subscription_checkout(db, team_id, new_subscription_id)
 
     cancel_subscription(db, team_id)
 

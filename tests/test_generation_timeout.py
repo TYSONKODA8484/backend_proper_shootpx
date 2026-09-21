@@ -79,6 +79,9 @@ def test_job_exceeding_its_own_tools_timeout_is_failed_and_refunded(monkeypatch)
     monkeypatch.setattr(worker, "refund_credits", refund)
     monkeypatch.setattr(worker, "release_generation_lock", release)
     monkeypatch.setattr(worker, "release_fal_slot", release_slot)
+    # The lock is only released when this was the user's LAST active job; on a
+    # MagicMock db that check would read as a truthy "yes, still active".
+    monkeypatch.setattr(worker.generation_svc, "_user_has_active_generation_job", lambda db_, uid: False)
 
     _run(worker.check_generation_timeouts({}))
 
@@ -219,6 +222,55 @@ def test_fal_confirms_already_completed_resolves_via_real_result_instead_of_fail
     handle_webhook.assert_called_once_with(db, job.id, result_payload)
     refund.assert_not_called()          # the timeout-failure path never ran
     assert job.status == "processing"   # _fail_stale_job was never reached -- handle_fal_webhook (mocked here, tested on its own elsewhere) owns the transition
+
+
+def test_completed_job_is_delivered_immediately_even_while_still_within_its_budget(monkeypatch):
+    """The real local-dev fix: fal's cloud can't reach a PUBLIC_BACKEND_URL of
+    127.0.0.1, so the webhook NEVER arrives and this poll is the only thing
+    that finishes a job. The COMPLETED check used to sit behind the budget
+    gate, so a job fal finished in 40s sat "processing" until its whole budget
+    elapsed -- 60s for recolor (looked fine), 180s for creative_photoshoot
+    (looked broken). Must deliver as soon as fal says COMPLETED."""
+    job = _job(feature_type="creative_photoshoot", seconds_old=20, fal_request_id="fal-req-789")
+    tool = _tool(timeout_seconds=180, fal_model_id="fake-model")  # 160s of budget still left
+    db = _timeout_db([job], {"creative_photoshoot": tool})
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    monkeypatch.setattr(worker, "check_fal_status", MagicMock(return_value={"status": "COMPLETED"}))
+    result_payload = {"status": "OK", "payload": {"images": [{"url": "https://fal.test/out.png"}]}}
+    fetch_result = MagicMock(return_value=result_payload)
+    monkeypatch.setattr(worker, "fetch_fal_result", fetch_result)
+    handle_webhook = MagicMock()
+    monkeypatch.setattr(worker.generation_svc, "handle_fal_webhook", handle_webhook)
+    refund = MagicMock()
+    monkeypatch.setattr(worker, "refund_credits", refund)
+
+    _run(worker.check_generation_timeouts({}))
+
+    fetch_result.assert_called_once_with("fake-model", "fal-req-789")
+    handle_webhook.assert_called_once_with(db, job.id, result_payload)
+    refund.assert_not_called()  # nothing timed out -- it succeeded well inside its budget
+
+
+def test_in_progress_job_within_its_budget_is_left_alone_not_failed(monkeypatch):
+    """Polling every tick must not become a way to kill jobs early -- fal says
+    still working and the budget hasn't elapsed, so nothing happens."""
+    job = _job(feature_type="creative_photoshoot", seconds_old=20, fal_request_id="fal-req-abc")
+    tool = _tool(timeout_seconds=180, fal_model_id="fake-model")
+    db = _timeout_db([job], {"creative_photoshoot": tool})
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    monkeypatch.setattr(worker, "check_fal_status", MagicMock(return_value={"status": "IN_PROGRESS"}))
+    fetch_result = MagicMock()
+    monkeypatch.setattr(worker, "fetch_fal_result", fetch_result)
+    refund = MagicMock()
+    monkeypatch.setattr(worker, "refund_credits", refund)
+
+    _run(worker.check_generation_timeouts({}))
+
+    assert job.status == "processing"  # untouched
+    fetch_result.assert_not_called()
+    refund.assert_not_called()
 
 
 def test_fal_confirms_still_in_progress_fails_per_the_timeout_and_logs_it(monkeypatch, caplog):

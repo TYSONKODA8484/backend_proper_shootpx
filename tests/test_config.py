@@ -33,9 +33,9 @@ def test_trailing_newline_in_env_var_is_stripped(monkeypatch):
         model_config = SettingsConfigDict(str_strip_whitespace=True)
         supabase_service_role_key: str
 
-    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "sb_secret_ft6xNG6hYmTcZWbv83dU-Q_ofH5If7Z\n")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "fake-test-key-not-a-real-secret\n")
 
     probe = Probe()
 
-    assert probe.supabase_service_role_key == "sb_secret_ft6xNG6hYmTcZWbv83dU-Q_ofH5If7Z"
+    assert probe.supabase_service_role_key == "fake-test-key-not-a-real-secret"
     assert "\n" not in probe.supabase_service_role_key
