@@ -57,8 +57,19 @@ class Settings(BaseSettings):
     public_backend_url: str
     supabase_url: str
     supabase_service_role_key: str
-    fal_concurrency_limit: int
     fal_per_team_concurrency_limit: int
+    # --- worker health monitoring (both OPTIONAL, unlike everything above) ----
+    # Monitoring must not become a new way for a deploy to fail to boot, so
+    # these have safe defaults instead of being required.
+    # How long the arq worker's event loop may go without ticking before the
+    # in-process watchdog declares it frozen, alerts, and hard-exits so the
+    # process manager restarts it. Must comfortably exceed the longest
+    # LEGITIMATE blocking stretch (a few sequential 30s HTTP timeouts in one
+    # job). 0 disables the watchdog.
+    worker_watchdog_seconds: int = 180
+    # Optional Slack/Discord-style incoming webhook. When set, a frozen-worker
+    # event POSTs a message there in addition to the CRITICAL log line.
+    alert_webhook_url: str | None = None
 
     @property
     def cors_origins_list(self) -> list[str]:

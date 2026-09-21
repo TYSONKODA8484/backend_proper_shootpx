@@ -1,21 +1,87 @@
 from app.core.cache import redis_client
 
-LOCK_TTL_SECONDS = 300  # 5 min safety net — auto-expires if a job dies without releasing
+# Generic safety net used only until the specific tool being generated is
+# known (acquire_generation_lock() itself runs before that lookup in most
+# callers) -- extend_generation_lock_ttl() below re-derives the REAL TTL from
+# that tool's own generation_timeout_seconds once it's available. Any tool
+# whose generation_timeout_seconds reaches or exceeds this fixed value would
+# otherwise have its lock silently expire while the job is still legitimately
+# running within its own timeout budget -- confirmed live: listing_photoshoot
+# is configured at exactly 300s, matching this constant precisely.
+LOCK_TTL_SECONDS = 300
+# Margin added on top of a tool's own generation_timeout_seconds so the lock
+# always outlives the job's worst-case runtime (network/queue jitter, the
+# worker's own delivery-poll cadence) rather than expiring right at the wire.
+LOCK_TTL_BUFFER_SECONDS = 30
 INFLIGHT_KEY_GLOBAL = "fal:inflight_count"
 
 
-def acquire_generation_lock(user_id) -> bool:
+def acquire_generation_lock(user_id, ttl_seconds: int = LOCK_TTL_SECONDS) -> bool:
     """
     Returns True if the lock was acquired (no generation currently running
     for this user). Returns False if the user already has one in progress.
+
+    The lock's value is the TTL it was set with (not a placeholder) -- that's
+    what lets generation_lock_age_seconds() compute age correctly for a lock
+    later extended to a tool-specific TTL via extend_generation_lock_ttl(),
+    instead of assuming every lock used the same fixed LOCK_TTL_SECONDS.
     """
     key = f"genlock:user:{user_id}"
-    return redis_client.set(key, "1", nx=True, ex=LOCK_TTL_SECONDS) is not None
+    return redis_client.set(key, str(ttl_seconds), nx=True, ex=ttl_seconds) is not None
+
+
+def extend_generation_lock_ttl(user_id, generation_timeout_seconds: int) -> None:
+    """
+    Re-derives the lock's TTL from the tool's own generation_timeout_seconds
+    (+ LOCK_TTL_BUFFER_SECONDS) once that value is known -- acquire_generation_
+    lock() itself is usually called before the specific tool is looked up, so
+    it starts with the generic LOCK_TTL_SECONDS safety net above. Called from
+    create_generation_batch as soon as the tool row is resolved, before any
+    of the (potentially slow) work after it.
+
+    A no-op if the lock isn't currently held (SET ... XX only applies to an
+    existing key) -- nothing to extend, and it must never resurrect a lock
+    that was already released.
+    """
+    key = f"genlock:user:{user_id}"
+    new_ttl = generation_timeout_seconds + LOCK_TTL_BUFFER_SECONDS
+    redis_client.set(key, str(new_ttl), xx=True, ex=new_ttl)
 
 
 def release_generation_lock(user_id) -> None:
     key = f"genlock:user:{user_id}"
     redis_client.delete(key)
+
+
+def generation_lock_age_seconds(user_id):
+    """
+    None if no lock is currently held for this user; otherwise roughly how
+    many seconds ago it was acquired (derived from the key's remaining TTL
+    against the TTL it was actually set with -- stored as the key's own
+    value, since Redis doesn't track acquisition time directly, and a lock's
+    real TTL can now differ per tool via extend_generation_lock_ttl()).
+
+    Used to self-heal a lock orphaned by a crash/restart between
+    acquire_generation_lock() and the job actually being created or the
+    except-block release running -- a hard process kill mid-request skips
+    that cleanup entirely, otherwise stranding the lock for its full TTL.
+    See create_generation_batch's stale-lock check.
+    """
+    key = f"genlock:user:{user_id}"
+    ttl = redis_client.ttl(key)
+    if ttl is None or ttl < 0:
+        return None
+
+    raw_original_ttl = redis_client.get(key)
+    try:
+        original_ttl = int(raw_original_ttl)
+    except (TypeError, ValueError):
+        # Defensive fallback only -- every lock set by this module's own
+        # acquire_generation_lock() stores its real TTL as its value, so this
+        # only triggers against a corrupted/foreign value at this key.
+        original_ttl = LOCK_TTL_SECONDS
+
+    return original_ttl - ttl
 
 
 def try_reserve_fal_slot(team_id) -> bool:

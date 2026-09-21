@@ -27,3 +27,4 @@ class GenerationJob(Base):
     credits_from_subscription = Column(Integer, nullable=False, default=0)
     credits_from_topup = Column(Integer, nullable=False, default=0)
     duration_seconds = Column(Integer, nullable=True)
+    title = Column(Text, nullable=True)

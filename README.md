@@ -32,6 +32,92 @@ Open:
 - http://localhost:8000/landing/billing
 - http://localhost:8000/landing/tools
 
+## Background worker (arq)
+
+[arq](https://arq-docs.helpmanual.io/) is a Redis-backed async task queue for
+Python. This backend uses it to run everything that shouldn't block an HTTP
+request: submitting a generation job to fal.ai, sweeping/timing-out stuck
+jobs, refilling subscription credits, and reconciling fal concurrency
+counters. `POST /generate` just enqueues a job and returns immediately — the
+actual work happens in a **separate process** (the arq worker), which is why
+it has to be started on its own, alongside `uvicorn`, not instead of it.
+
+`app/worker.py` defines the jobs (`WorkerSettings.functions`) and the cron
+schedule (`WorkerSettings.cron_jobs`):
+
+| Job | Trigger |
+|-----|---------|
+| `submit_generation_to_fal` | enqueued by `POST /generate` (one per job) |
+| `sweep_stale_generation_jobs` | cron, every 15 min |
+| `check_generation_timeouts` | cron, every 15 sec |
+| `reconcile_fal_slots` | cron, every 10 min |
+| `refill_due_subscriptions` | cron, daily at 03:00 |
+| `cleanup_stale_pending_subscriptions` | cron, daily at 04:00 |
+
+**Run it** (same `.env` as the API — it reads settings through
+`app.core.config`, so nothing extra to configure beyond what's already there):
+
+```bash
+arq app.worker.WorkerSettings
+```
+
+Run this in its own terminal, alongside `uvicorn app.main:app --reload` — both
+need to be running for generation jobs to actually complete (the API enqueues,
+the worker executes). Add `--watch app` to auto-restart it on code changes,
+same idea as uvicorn's `--reload`:
+
+```bash
+arq app.worker.WorkerSettings --watch app
+```
+
+- Needs `REDIS_URL` reachable (same Redis as caching/rate-limiting — arq uses
+  it as the job queue, not just a cache here).
+- Needs `FAL_KEY` and `PUBLIC_BACKEND_URL` set — `submit_generation_to_fal`
+  calls fal.ai and gives it a webhook URL (`PUBLIC_BACKEND_URL/webhooks/fal`)
+  to call back on completion. Locally, fal.ai can't reach `localhost`, so
+  webhook delivery only works with a publicly reachable `PUBLIC_BACKEND_URL`
+  (e.g. an ngrok tunnel) — without one, jobs still submit but rely on the
+  worker's own polling fallback (`check_generation_timeouts`) to eventually
+  notice completion instead of getting the webhook immediately.
+- Stop with `Ctrl+C` — `WorkerSettings.on_shutdown` logs a clean shutdown.
+
+### Running the worker in production (read this before going live)
+
+The worker is a **separate process/service** from the API (`arq app.worker.WorkerSettings`
+as its own Render *Background Worker*, systemd unit, container, etc.). If it is
+down or frozen, generations sit in `queued` and nothing else fails loudly — so
+it needs three layers of protection, all of which exist in this repo:
+
+1. **Automatic restart of a frozen worker (in-process watchdog).** The worker
+   runs every job and cron on one event loop, and much of the work (psycopg2,
+   sync httpx) blocks. One hung call — e.g. a DB connection that died silently
+   mid-query — froze a worker for 40+ minutes while the process stayed *alive*,
+   so nothing restarted it. `app/core/watchdog.py` runs a thread that watches
+   the loop; if the loop is silent for `WORKER_WATCHDOG_SECONDS` (default 180)
+   it logs `WORKER_FROZEN` at CRITICAL, posts to `ALERT_WEBHOOK_URL` (if set)
+   and hard-exits with **code 70**. **Your process manager must be configured
+   to restart the worker whenever it exits** — Render restarts a crashed
+   service automatically; systemd needs `Restart=always`; Docker needs
+   `restart: unless-stopped`; supervisor needs `autorestart=true`. Without a
+   restart-on-exit policy the watchdog just turns "frozen" into "dead".
+2. **External alerting (`GET /health/worker`).** Point an uptime monitor
+   (UptimeRobot, Better Stack, Render health checks…) at
+   `https://<api>/health/worker`. It returns **503** when the worker heartbeat
+   is missing or due jobs are overdue by more than 2 minutes, and covers the
+   case the in-process watchdog cannot: the worker process being completely
+   dead. Alert after 2–3 consecutive failures (a single legitimate 30s
+   blocking HTTP call can briefly delay the heartbeat). The same heartbeat is
+   available to container probes as `arq --check app.worker.WorkerSettings`.
+3. **Stuck-job cleanup.** `sweep_stale_generation_jobs` (every 15 min, inside
+   the worker) fails any job stuck in `queued`/`processing` for over 10 minutes
+   and refunds its credits. Note it runs *in the same worker*, so it only
+   helps once the worker is running again — layers 1 and 2 are what get it
+   running.
+
+Database connections use TCP keepalives + a connect timeout
+(`app/core/database.py`) so a dead connection raises an error within about a
+minute instead of hanging forever.
+
 ## Cache
 
 `GET /landing/billing` and `GET /landing/tools` are cached in Redis for 1 hour
@@ -166,6 +252,14 @@ No silent defaults — if a variable is missing or invalid, the app refuses to s
 | `RAZORPAY_KEY_ID` | `rzp_test_xxx` | Razorpay API key id (test or live) |
 | `RAZORPAY_KEY_SECRET` | `xxx` | Razorpay API key secret |
 | `RAZORPAY_WEBHOOK_SECRET` | `xxx` | Secret configured on the Razorpay webhook — verifies `POST /billing/webhook` signatures |
+| `FAL_KEY` | `xxx` | fal.ai API key — the arq worker calls fal.ai's generation models with it |
+| `PUBLIC_BACKEND_URL` | `https://api.shootpx.com` | Publicly reachable base URL fal.ai's webhook calls back to (`{PUBLIC_BACKEND_URL}/webhooks/fal`) — needs a tunnel (e.g. ngrok) to work locally |
+| `SUPABASE_URL` | `https://xxx.supabase.co` | Supabase project URL — used for storing generated output images |
+| `SUPABASE_SERVICE_ROLE_KEY` | `xxx` | Supabase service role key (storage uploads) |
+| `FAL_CONCURRENCY_LIMIT` | `10` | Max fal.ai jobs in flight account-wide at once |
+| `FAL_PER_TEAM_CONCURRENCY_LIMIT` | `2` | Max fal.ai jobs in flight per team at once |
+| `WORKER_WATCHDOG_SECONDS` | `180` (optional) | Seconds the worker's event loop may be silent before it alerts and exits for a restart. `0` disables |
+| `ALERT_WEBHOOK_URL` | *(unset)* (optional) | Slack/Discord-style incoming webhook that receives the `WORKER_FROZEN` alert |
 
 ## Structure
 

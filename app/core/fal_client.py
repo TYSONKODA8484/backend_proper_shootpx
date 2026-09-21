@@ -3,17 +3,27 @@ import logging
 import httpx
 
 from app.core.config import settings
+from app.core.http_retry import send_with_retry
 
 logger = logging.getLogger(__name__)
 
 
 def submit_to_fal(model_id: str, input_params: dict, webhook_url: str) -> str:
-    response = httpx.post(
-        f"https://queue.fal.run/{model_id}",
-        params={"fal_webhook": webhook_url},
-        headers={"Authorization": f"Key {settings.fal_key}"},
-        json=input_params,
-        timeout=30,
+    # Retried on transient failures (see app/core/http_retry.py for the rules).
+    # Known trade-off: a READ timeout is ambiguous -- fal may have received and
+    # queued the request but never answered in time, so a retry can queue a
+    # second request for the same job. That costs at most one extra generation
+    # on a rare event, and the duplicate's webhook is ignored (the job is
+    # already resolved) -- far better than failing a healthy job for the user.
+    response = send_with_retry(
+        lambda: httpx.post(
+            f"https://queue.fal.run/{model_id}",
+            params={"fal_webhook": webhook_url},
+            headers={"Authorization": f"Key {settings.fal_key}"},
+            json=input_params,
+            timeout=30,
+        ),
+        "fal.ai submit",
     )
     try:
         response.raise_for_status()
@@ -25,6 +35,25 @@ def submit_to_fal(model_id: str, input_params: dict, webhook_url: str) -> str:
         raise
     return response.json()["request_id"]
 
+def _queue_app_id(model_id: str) -> str:
+    """
+    submit_to_fal() must use the full model_id, including any trailing
+    endpoint-variant segment (e.g. "openai/gpt-image-2/edit" -- "edit" is a
+    specific endpoint under the "openai/gpt-image-2" app). But fal's queue
+    status/result/cancel endpoints live under the base app id ONLY --
+    confirmed live: GET .../openai/gpt-image-2/edit/requests/{id}/status
+    returns 405 (Allow: POST) from fal's real API, while GET
+    .../openai/gpt-image-2/requests/{id}/status (base app id, no "/edit")
+    returns the real status correctly. fal's own response bodies confirm
+    this: response_url/status_url on a submit response for this model both
+    come back rooted at "openai/gpt-image-2", never including "/edit".
+    Stripping to the first two "/"-separated segments matches fal's
+    documented owner/app-name convention generally, not just this one model.
+    """
+    parts = model_id.split("/")
+    return "/".join(parts[:2]) if len(parts) > 2 else model_id
+
+
 def check_fal_status(model_id: str, request_id: str) -> dict:
     """
     Real status of an already-submitted request, via fal's queue status
@@ -34,7 +63,7 @@ def check_fal_status(model_id: str, request_id: str) -> dict:
     elapsed (our budget elapsing does not mean fal's did too).
     """
     response = httpx.get(
-        f"https://queue.fal.run/{model_id}/requests/{request_id}/status",
+        f"https://queue.fal.run/{_queue_app_id(model_id)}/requests/{request_id}/status",
         headers={"Authorization": f"Key {settings.fal_key}"},
         timeout=15,
     )
@@ -59,7 +88,7 @@ def fetch_fal_result(model_id: str, request_id: str) -> dict:
     the result straight into it exactly like a real webhook delivery would.
     """
     response = httpx.get(
-        f"https://queue.fal.run/{model_id}/requests/{request_id}",
+        f"https://queue.fal.run/{_queue_app_id(model_id)}/requests/{request_id}",
         headers={"Authorization": f"Key {settings.fal_key}"},
         timeout=15,
     )
@@ -80,11 +109,18 @@ def call_fal_sync(model_id: str, input_params: dict) -> dict:
     Only use this for calls that genuinely finish in a few seconds; anything
     slower (like the real generation) must use the queue + webhook pattern.
     """
-    response = httpx.post(
-        f"https://fal.run/{model_id}",
-        headers={"Authorization": f"Key {settings.fal_key}"},
-        json=input_params,
-        timeout=30,
+    # Retried on transient failures (app/core/http_retry.py). These are the
+    # vision/planning calls (listing shots, model-shoot analysis, scene and
+    # recolor instructions); a retry after an ambiguous read timeout can at
+    # worst repeat one cheap vision call.
+    response = send_with_retry(
+        lambda: httpx.post(
+            f"https://fal.run/{model_id}",
+            headers={"Authorization": f"Key {settings.fal_key}"},
+            json=input_params,
+            timeout=30,
+        ),
+        "fal.ai sync call",
     )
     try:
         response.raise_for_status()

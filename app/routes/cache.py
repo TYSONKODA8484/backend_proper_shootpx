@@ -18,7 +18,7 @@ def clear_cache(request: Request, x_cache_secret: str = Header(...)):
         raise HTTPException(status_code=403, detail="Invalid secret")
 
     try:
-        keys = redis_client.keys("landing:*")
+        keys = redis_client.keys("landing:*") + redis_client.keys("tooldef:*")
         if keys:
             redis_client.delete(*keys)
     except RedisError:

@@ -285,6 +285,196 @@ def test_lapse_pass_is_a_noop_when_nothing_cancelled(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# send_yearly_renewal_notices -- yearly plans have no second "charged"
+# webhook to key a notice off (total_count=1), so this checks
+# current_period_end directly instead of paid_count. Real fix for: yearly
+# subscribers previously got NO advance warning before losing access, while
+# week/month subscribers did (see handle_subscription_charged's own
+# paid_count-based notice in app/services/webhooks.py).
+# --------------------------------------------------------------------------- #
+
+def _yearly_notice_db(due=()):
+    """Same call-counting trick as _refill_db: the batch query (a .join(...)
+    off TeamSubscription) is the 1st db.query(TeamSubscription) call, then
+    each subsequent call is the per-row re-fetch-by-id under
+    .with_for_update(), in loop order."""
+    db = MagicMock()
+    due = list(due)
+    seen = {"team_sub_calls": 0}
+
+    def query(model):
+        q = MagicMock()
+        name = getattr(model, "__name__", "")
+        if name == "TeamSubscription":
+            seen["team_sub_calls"] += 1
+            call_index = seen["team_sub_calls"]
+            if call_index == 1:
+                q.join.return_value.filter.return_value.all.return_value = due
+            else:
+                row_index = call_index - 2
+                row = due[row_index] if 0 <= row_index < len(due) else None
+                (q.filter.return_value.populate_existing.return_value
+                   .with_for_update.return_value.first.return_value) = row
+        return q
+
+    db.query.side_effect = query
+    return db
+
+
+def test_yearly_renewal_notice_fires_exactly_30_days_out(monkeypatch):
+    sent = []
+    monkeypatch.setattr(worker, "send_renewal_notice_email", lambda db, ts: sent.append(ts))
+    now = datetime.now(timezone.utc)
+    ts = MagicMock(
+        team_id="team-1", status="active", renewal_notice_sent_at=None,
+        current_period_end=now + timedelta(days=30),
+    )
+    db = _yearly_notice_db([ts])
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    _run(worker.send_yearly_renewal_notices({}))
+
+    assert sent == [ts]
+    assert ts.renewal_notice_sent_at is not None
+    db.commit.assert_called_once()
+    db.close.assert_called_once()
+
+
+def test_yearly_renewal_notice_does_not_fire_31_days_out(monkeypatch):
+    """31 days out is past the window -- the function's own re-check (not
+    just the SQL WHERE, which a mocked db can't exercise) must still skip a
+    row that somehow reached the loop outside the window."""
+    sent = []
+    monkeypatch.setattr(worker, "send_renewal_notice_email", lambda db, ts: sent.append(ts))
+    now = datetime.now(timezone.utc)
+    ts = MagicMock(
+        team_id="team-1", status="active", renewal_notice_sent_at=None,
+        current_period_end=now + timedelta(days=31),
+    )
+    db = _yearly_notice_db([ts])
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    _run(worker.send_yearly_renewal_notices({}))
+
+    assert sent == []
+    assert ts.renewal_notice_sent_at is None
+    db.commit.assert_not_called()
+
+
+def test_yearly_renewal_notice_is_not_resent_once_already_sent(monkeypatch):
+    sent = []
+    monkeypatch.setattr(worker, "send_renewal_notice_email", lambda db, ts: sent.append(ts))
+    now = datetime.now(timezone.utc)
+    already_sent_at = now - timedelta(days=1)
+    ts = MagicMock(
+        team_id="team-1", status="active", renewal_notice_sent_at=already_sent_at,
+        current_period_end=now + timedelta(days=29),
+    )
+    db = _yearly_notice_db([ts])
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    _run(worker.send_yearly_renewal_notices({}))
+
+    assert sent == []
+    assert ts.renewal_notice_sent_at == already_sent_at  # untouched
+    db.commit.assert_not_called()
+
+
+def test_yearly_renewal_notice_skips_a_non_active_row(monkeypatch):
+    sent = []
+    monkeypatch.setattr(worker, "send_renewal_notice_email", lambda db, ts: sent.append(ts))
+    now = datetime.now(timezone.utc)
+    ts = MagicMock(
+        team_id="team-1", status="cancelled", renewal_notice_sent_at=None,
+        current_period_end=now + timedelta(days=10),
+    )
+    db = _yearly_notice_db([ts])
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    _run(worker.send_yearly_renewal_notices({}))
+
+    assert sent == []
+
+
+def test_yearly_renewal_notice_query_filters_on_year_period_and_active_status(monkeypatch):
+    """Confirms the batch query actually joins Subscription and filters
+    period_label == 'year' (not week/month) and status == 'active' -- via the
+    real filter args, same pattern as test_lapse_query_targets_cancelled_past_
+    reset_with_credits above."""
+    captured = {}
+    db = MagicMock()
+
+    def query(model):
+        q = MagicMock()
+        name = getattr(model, "__name__", "")
+        if name == "TeamSubscription":
+            def jf(*args):
+                captured["args"] = args
+                m = MagicMock()
+                m.all.return_value = []
+                return m
+            q.join.return_value.filter.side_effect = jf
+        return q
+
+    db.query.side_effect = query
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    _run(worker.send_yearly_renewal_notices({}))
+
+    sql = " ".join(str(a) for a in captured["args"])
+    assert "team_subscriptions.status =" in sql
+    assert "subscription.period_label =" in sql
+    assert "team_subscriptions.current_period_end <=" in sql
+    assert "team_subscriptions.renewal_notice_sent_at IS NULL" in sql
+
+
+def test_yearly_renewal_notice_one_failure_does_not_abort_the_batch(monkeypatch):
+    def send(db, ts):
+        if ts.team_id == "bad":
+            raise ValueError("SMTP exploded")
+    monkeypatch.setattr(worker, "send_renewal_notice_email", send)
+    now = datetime.now(timezone.utc)
+    bad = MagicMock(team_id="bad", status="active", renewal_notice_sent_at=None,
+                    current_period_end=now + timedelta(days=5))
+    good = MagicMock(team_id="good", status="active", renewal_notice_sent_at=None,
+                     current_period_end=now + timedelta(days=5))
+    db = _yearly_notice_db([bad, good])
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+
+    _run(worker.send_yearly_renewal_notices({}))
+
+    db.rollback.assert_called_once()                    # the bad one rolled back
+    assert good.renewal_notice_sent_at is not None       # the good one still processed
+    db.close.assert_called_once()
+
+
+def test_yearly_renewal_notice_reset_on_a_fresh_subscribe_cycle(monkeypatch):
+    """create_subscription_checkout must clear renewal_notice_sent_at on a
+    resubscribe -- otherwise a team resubscribing after a yearly plan
+    completed would carry over the OLD cycle's sent_at and never get warned
+    before the new cycle also ends."""
+    from app.services import billing as billing_svc
+    from app.models.team_subscription import TeamSubscription
+
+    plan = MagicMock(id="plan-1", razorpay_plan_id="plan_rzp_1", period_label="year")
+    existing_row = TeamSubscription(team_id="team-1")
+    existing_row.status = "cancelled"
+    existing_row.renewal_notice_sent_at = datetime.now(timezone.utc) - timedelta(days=200)
+
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = plan
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = existing_row
+    monkeypatch.setattr(
+        billing_svc.razorpay_client.subscription, "create",
+        lambda *a, **k: {"id": "sub_new", "short_url": "https://rzp.test/x"},
+    )
+
+    billing_svc.create_subscription_checkout(db, "team-1", "plan-1")
+
+    assert existing_row.renewal_notice_sent_at is None
+
+
+# --------------------------------------------------------------------------- #
 # cleanup_stale_pending_subscriptions
 # --------------------------------------------------------------------------- #
 
