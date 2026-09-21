@@ -11,7 +11,7 @@ from app.models.team_invite import TeamInvite
 from app.models.team_member import TeamMember
 from app.models.team_subscription import TeamSubscription
 from app.models.user import User
-from app.services.billing import cancel_subscription
+from app.services.billing import cancel_subscription, is_unpaid_checkout
 
 logger = logging.getLogger(__name__)
 
@@ -396,12 +396,20 @@ def get_team_billing(db: Session, team_id: UUID) -> dict:
         raise ValueError("Team not found")
 
     team, sub, plan = row
+    unpaid = is_unpaid_checkout(sub)
 
     return {
         "total_credits": get_total_credits(team),
         "subscription_credits": team.subscription_credits_remaining,
         "topup_credits": team.topup_credits_balance,
         "plan": plan.slug if plan else None,
-        "subscription_status": sub.status if sub else None,
-        "current_period_end": sub.current_period_end.isoformat() if sub else None,
+        # "created" = a checkout was started but never paid (internally a
+        # "pending" row with no activation yet) -- distinct from a real
+        # "pending", which means an ACTIVE subscription whose renewal payment
+        # failed and is being retried. The frontend must be able to tell them
+        # apart: one is "payment not completed", the other is a live plan.
+        "subscription_status": ("created" if unpaid else sub.status) if sub else None,
+        # An unpaid attempt has no billing period -- the placeholder date the
+        # checkout claim stores must never be shown as a renewal date.
+        "current_period_end": sub.current_period_end.isoformat() if sub and not unpaid else None,
     }
