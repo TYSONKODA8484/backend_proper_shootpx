@@ -279,11 +279,22 @@ async def send_yearly_renewal_notices(ctx):
 
 
 async def cleanup_stale_pending_subscriptions(ctx):
+    """Housekeeping for checkouts that were started and never paid.
+
+    ONLY never-activated rows (credits_per_refill == 0). "pending" is also the
+    status of a real, paying subscription whose renewal payment failed while
+    Razorpay retries for days (webhooks.handle_subscription_pending) -- and
+    created_at is the row's ORIGINAL signup date, so without this condition
+    the sweep deleted such a customer's subscription outright the next time it
+    ran. Abandoned attempts no longer block re-checkout (see
+    billing.create_subscription_checkout), so this is tidy-up, not a gate.
+    """
     db = SessionLocal()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
 
     stale = db.query(TeamSubscription).filter(
         TeamSubscription.status == "pending",
+        TeamSubscription.credits_per_refill == 0,
         TeamSubscription.created_at <= cutoff,
     ).all()
 
@@ -867,7 +878,7 @@ class WorkerSettings:
     cron_jobs = [
         cron(refill_due_subscriptions, hour=3, minute=0),
         cron(send_yearly_renewal_notices, hour=3, minute=30),
-        cron(cleanup_stale_pending_subscriptions, hour=4, minute=0),
+        cron(cleanup_stale_pending_subscriptions, minute={7, 22, 37, 52}),
         cron(sweep_stale_generation_jobs, minute={0, 15, 30, 45}),
         cron(check_generation_timeouts, second={0, 15, 30, 45}),
         cron(reconcile_fal_slots, minute={0, 10, 20, 30, 40, 50}),
